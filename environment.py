@@ -141,6 +141,11 @@ class KSPEnvironment:
         reward = self.calculate_reward(observation)
         terminated, truncated, info = self.check_episode_end(observation)
 
+        # Add the task-specific success bonus or failure penalty.
+        terminal_reward = self.outcome_reward(info["end_reason"])
+        reward += terminal_reward
+        self.reward_components["outcome_reward"] = terminal_reward
+
         self.episode_finished = terminated or truncated
 
         state = self.encode_observation(observation)
@@ -439,11 +444,12 @@ class KSPEnvironment:
 
     def end_failed_episode(self, reason):
         self.episode_finished = True
+        reward = self.outcome_reward(reason)
 
         self.reward_components = {
             "orbit_reward": 0.0,
             "fuel_penalty": 0.0,
-            "outcome_reward": -10.0,
+            "outcome_reward": reward,
         }
 
         info = {
@@ -455,4 +461,27 @@ class KSPEnvironment:
             "telemetry_stale": True,
         }
 
-        return self.last_state.copy(), -10.0, True, False, info
+        return self.last_state.copy(), reward, True, False, info
+
+
+    def outcome_reward(self, reason):
+        if self.task == "orbit":
+            rewards = {
+                "orbit_achieved": 10.0,
+                "returned_to_surface": -20.0,
+                "spacecraft_destroyed": -20.0,
+                "spacecraft_mass_lost": -20.0,
+                "time_limit": 0.0,
+            }
+
+            if reason is None:
+                return 0.0
+
+            if reason not in rewards:
+                raise ValueError(f"Unknown orbit outcome: {reason}")
+
+            return rewards[reason]
+
+        raise NotImplementedError(
+            f"Outcome rewards are undefined for task: {self.task}"
+        )

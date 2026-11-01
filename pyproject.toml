@@ -11,6 +11,7 @@ dependencies = [
     "numpy>=1.24,<3",
     "torch>=2.0,<3",
     "tqdm>=4.66,<5",
+    "torchvision>=0.15,<1",
 ]
 
 [project.optional-dependencies]

@@ -347,10 +347,13 @@ def test():
 		print("Test interrupted.")
 
 
-if __name__ == "__main__":
+def main():
 	args = parse_args()
-
 	if args.mode == "test":
-		test()  # Your existing test function.
+		test()
 	else:
 		train(args)
+
+
+if __name__ == "__main__":
+	main()

@@ -88,6 +88,9 @@ def train(args):
 
 		previous_ut = client.telemetry["ut"]()
 
+		training_start = time.monotonic()
+		successful_episodes = 0
+
 		print("Training starts")
 
 		with tqdm(total=args.updates * args.rollout_steps, desc="Collecting", unit="step", dynamic_ncols=True) as progress:
@@ -174,11 +177,24 @@ def train(args):
 					needs_reset = terminated or truncated
 
 					total_steps += 1
+					if run is not None:
+						metrics = {"rollout/reward": reward, "train/elapsed_seconds": time.monotonic() - training_start}
+						if not info.get("telemetry_stale", False):
+							telemetry = info.get("telemetry", {})
+							for name in ("altitude", "apoapsis", "periapsis", "mass"):
+								if name in telemetry:
+									metrics[f"telemetry/{name}"] = telemetry[name]
+						run.log(metrics, step=total_steps)
+
 					episode_steps += 1
 					episode_return += float(reward)
 
 					if needs_reset:
 						episode_count += 1
+
+						successful_episodes += int(info.get("success", False))
+						if run is not None:
+							run.log({"episode/return": episode_return, "episode/length": episode_steps, "episode/success_rate": successful_episodes / episode_count}, step=total_steps)
 
 						finished_episodes.append({"return": episode_return, "length": episode_steps, "success": bool(info.get("success", False))})
 
@@ -251,34 +267,15 @@ def train(args):
 						checkpoint_path,
 					)
 
-					active_collection_seconds = max(collection_seconds - reset_seconds, 1e-8)
-
 					log_data = {
 						"train/update": update_index + 1,
 						"train/episodes": episode_count,
 						"train/update_seconds": update_seconds,
-						"timing/collection_seconds": collection_seconds,
-						"timing/reset_seconds": reset_seconds,
-						"timing/env_step_seconds": env_step_seconds,
-						"timing/action_inference_seconds": (action_inference_seconds),
 						"rollout/reward_mean": float(np.mean(rollout["rewards"])),
 						"rollout/reset_count": reset_count,
-						"rollout/simulated_seconds": simulated_seconds,
 						"rollout/bootstrap_evaluations": (bootstrap_evaluations),
-						"throughput/steps_per_second": (args.rollout_steps / max(collection_seconds, 1e-8)),
-						"throughput/sim_seconds_per_wall_second": (simulated_seconds / max(collection_seconds, 1e-8)),
-						"throughput/active_sim_seconds_per_wall_second": (simulated_seconds / active_collection_seconds),
 						**{f"ppo/{name}": value for name, value in metrics.items() if value is not None},
 					}
-
-					if finished_episodes:
-						log_data.update(
-							{
-								"episode/return_mean": float(np.mean([item["return"] for item in finished_episodes])),
-								"episode/length_mean": float(np.mean([item["length"] for item in finished_episodes])),
-								"episode/success_rate": float(np.mean([item["success"] for item in finished_episodes])),
-							}
-						)
 
 					if run is not None:
 						run.log(log_data, step=total_steps)

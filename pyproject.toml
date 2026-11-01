@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ksp_rl"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "krpc==0.7.0",
+    "numpy>=1.24,<3",
+    "torch>=2.0,<3",
+    "tqdm>=4.66,<5",
+]
+
+[project.optional-dependencies]
+tracking = ["wandb>=0.17,<1"]
+dev = ["ruff>=0.9,<1"]
+
+[tool.setuptools]
+packages = []
+py-modules = ["main", "client", "environment", "agent"]
+include-package-data = false
+
+[project.scripts]
+launch = "main:main"
+
+[tool.ruff]
+line-length = 200
+target-version = "py310"
+extend-exclude = [".venv", "venv", "checkpoints", "runs", "wandb", "GameData"]
+
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "tab"
+skip-magic-trailing-comma = true
+line-ending = "auto"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

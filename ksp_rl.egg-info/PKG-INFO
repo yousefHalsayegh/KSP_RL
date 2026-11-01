@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: ksp_rl
+Version: 0.1.0
+Requires-Python: >=3.10
+Requires-Dist: krpc==0.7.0
+Requires-Dist: numpy<3,>=1.24
+Requires-Dist: torch<3,>=2.0
+Requires-Dist: tqdm<5,>=4.66
+Provides-Extra: tracking
+Requires-Dist: wandb<1,>=0.17; extra == "tracking"
+Provides-Extra: dev
+Requires-Dist: ruff<1,>=0.9; extra == "dev"

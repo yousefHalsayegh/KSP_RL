@@ -61,8 +61,6 @@ def train(args):
 		for name in ("model", "optimizer", "observation_size", "completed_updates", "total_steps"):
 			if name not in checkpoint:
 				raise ValueError(f"Checkpoint is missing required field: {name}")
-		# Keep the previous experiment's training settings. Device, tracking and
-		# the number of additional updates remain controlled by this invocation.
 		for name in ("seed", "rollout_steps", "episode_seconds", "epochs", "batch_size", "learning_rate", "gamma", "gae_lambda"):
 			if name in checkpoint.get("config", {}):
 				setattr(args, name, checkpoint["config"][name])
@@ -81,7 +79,6 @@ def train(args):
 	torch.manual_seed(args.seed)
 
 	try:
-		# No W&B import or initialization unless explicitly enabled.
 		if args.wandb:
 			import wandb  # type: ignore
 
@@ -101,8 +98,6 @@ def train(args):
 				resume="must" if run_id else None,
 			)
 			wandb_metadata = {"id": run.id, "project": run.project, "entity": run.entity}
-			# A crash can leave W&B ahead of the last completed-update checkpoint.
-			# Keep its history steps increasing without changing the training counter.
 			wandb_step_offset = max(0, int(run.step) - total_steps)
 
 		client = KSPClient(name="Custom PPO Training")
@@ -110,10 +105,6 @@ def train(args):
 		env = KSPEnvironment(client, task="orbit", episode_seconds=args.episode_seconds)
 
 		if checkpoint is not None:
-			if checkpoint["observation_size"] != len(env.last_state):
-				raise ValueError("Checkpoint observation size does not match the current environment.")
-			if "observation_names" in checkpoint and list(checkpoint["observation_names"]) != list(env.observation_names):
-				raise ValueError("Checkpoint observation names/order do not match the current environment.")
 			if checkpoint.get("action_size", 5) != 5:
 				raise ValueError("Checkpoint does not use this environment's five-action layout.")
 
@@ -128,7 +119,6 @@ def train(args):
 			agent.load_state_dict(checkpoint["model"])
 			agent.optimizer.load_state_dict(checkpoint["optimizer"])
 			args.learning_rate = agent.optimizer.param_groups[0]["lr"]
-			# The checkpoint contains learning state, not a saved KSP flight.
 			state = env.reset()
 			rng = checkpoint.get("rng", {})
 			if "torch" in rng:
@@ -175,7 +165,6 @@ def train(args):
 				rollout = {name: [] for name in ("states", "raw_actions", "old_log_probabilities", "rewards", "values", "next_values", "terminated", "truncated")}
 				finished_episodes = []
 
-				# Timing and throughput measurements for this rollout.
 				collection_start = time.perf_counter()
 
 				reset_seconds = 0.0
@@ -201,7 +190,6 @@ def train(args):
 						reset_count += 1
 						needs_reset = False
 
-						# Revert changes game time, so start a new baseline.
 						previous_ut = env.previous_observation["ut"]
 
 					inference_start = time.perf_counter()
@@ -210,7 +198,6 @@ def train(args):
 
 					action_inference_seconds += time.perf_counter() - inference_start
 
-					# Reuse V(state) as the previous transition's next value.
 					if rollout["next_values"] and rollout["next_values"][-1] is None:
 						rollout["next_values"][-1] = result["value"]
 
@@ -220,7 +207,6 @@ def train(args):
 
 					env_step_seconds += time.perf_counter() - step_start
 
-					# Measure simulated time without spanning episode resets.
 					if not info.get("telemetry_stale", False):
 						current_ut = info["telemetry"]["ut"]
 
@@ -229,16 +215,13 @@ def train(args):
 						previous_ut = current_ut
 
 					if terminated:
-						# True terminal states have zero future value.
 						next_value = 0.0
 
 					elif truncated:
-						# Evaluate the final state before resetting.
 						next_value = agent.estimate_value(next_state)
 						bootstrap_evaluations += 1
 
 					else:
-						# Filled by the next iteration's agent.act(state).
 						next_value = None
 
 					rollout["states"].append(state.copy())
@@ -256,6 +239,8 @@ def train(args):
 					total_steps += 1
 					if run is not None:
 						metrics = {"rollout/reward": reward, "train/environment_steps": total_steps, "train/elapsed_seconds": time.monotonic() - training_start}
+						for name, value in info["reward_components"].items():
+							metrics[f"reward/{name}"] = -float(value) if name.endswith("_penalty") else float(value)
 						if not info.get("telemetry_stale", False):
 							telemetry = info.get("telemetry", {})
 							for name in ("altitude", "apoapsis", "periapsis", "mass"):
@@ -302,8 +287,6 @@ def train(args):
 
 					update_start = time.perf_counter()
 
-					# An unfinished rollout has no following action to
-					# provide its final next-state value.
 					if rollout["next_values"][-1] is None:
 						rollout["next_values"][-1] = agent.estimate_value(state)
 						bootstrap_evaluations += 1

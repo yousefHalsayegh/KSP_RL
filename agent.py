@@ -15,13 +15,10 @@ class PPOAgent(nn.Module):
 		self.device = torch.device(device)
 		self.observation_size = observation_size
 
-		# Actor: produces the mean of each action's distribution.
 		self.actor = nn.Sequential(nn.Linear(observation_size, hidden_size), nn.Tanh(), nn.Linear(hidden_size, hidden_size), nn.Tanh(), nn.Linear(hidden_size, action_size))
 
-		# Learnable exploration level for each action.
 		self.log_std = nn.Parameter(torch.full((action_size,), -0.5))
 
-		# Critic: produces one state-value estimate.
 		self.critic = nn.Sequential(nn.Linear(observation_size, hidden_size), nn.Tanh(), nn.Linear(hidden_size, hidden_size), nn.Tanh(), nn.Linear(hidden_size, 1))
 
 		self.to(self.device)
@@ -34,7 +31,6 @@ class PPOAgent(nn.Module):
 		return Normal(mean, std)
 
 	def action_log_probability(self, distribution, raw_actions):
-		# Correct the probability for the tanh transformation.
 		log_jacobian = 2.0 * (math.log(2.0) - raw_actions - F.softplus(-2.0 * raw_actions))
 
 		return (distribution.log_prob(raw_actions) - log_jacobian).sum(dim=-1)
@@ -53,7 +49,6 @@ class PPOAgent(nn.Module):
 
 		raw_action = distribution.mean if deterministic else distribution.sample()
 
-		# Convert unbounded samples into environment actions in [-1, 1].
 		action = torch.tanh(raw_action)
 
 		log_probability = self.action_log_probability(distribution, raw_action)
@@ -109,7 +104,6 @@ class PPOAgent(nn.Module):
 		gae = torch.zeros((), device=self.device)
 
 		for t in reversed(range(len(rewards))):
-			# Neither termination nor truncation may connect to the next episode.
 			continue_episode = (~(terminated[t] | truncated[t])).float()
 
 			gae = deltas[t] + gamma * gae_lambda * continue_episode * gae

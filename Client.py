@@ -12,6 +12,7 @@ class KSPClient:
 		self._bind_vessel()
 
 	def _bind_vessel(self):
+		self._clear_stage_streams()
 		self.vessel = self.sc.active_vessel
 		self.control = self.vessel.control
 		self.ap = self.vessel.auto_pilot
@@ -47,7 +48,6 @@ class KSPClient:
 			"pitch_input": stream_property(self.control, "pitch"),
 			"yaw_input": stream_property(self.control, "yaw"),
 			"roll_input": stream_property(self.control, "roll"),
-			"stage": stream_property(self.control, "current_stage"),
 			"sas": stream_property(self.control, "sas"),
 			"situation": stream_property(self.vessel, "situation"),
 			"apoapsis": stream_property(self.vessel.orbit, "apoapsis_altitude"),
@@ -115,10 +115,70 @@ class KSPClient:
 		self.control.roll = max(-1.0, min(1.0, roll))
 
 	def activate_next_stage(self):
+		before = self.control.current_stage
+		if before <= 0:
+			return None
+		self._clear_stage_streams()
 		self.control.activate_next_stage()
+		after = self.control.current_stage
+		return before - 1 if after < before else None
+
+	def _clear_stage_streams(self):
+		for stream, _ in getattr(self, "_stage_resource_streams", []):
+			stream.remove()
+		self._stage_resource_streams = []
+		self._stage_cache_key = None
+		self._stage_info = {}
+
+	def read_next_stage(self, current_stage):
+		if current_stage != self._stage_cache_key:
+			self._clear_stage_streams()
+			info = {
+				name: 0.0
+				for name in (
+					"next_stage_available",
+					"next_stage_engine_count",
+					"next_stage_vacuum_thrust",
+					"next_stage_decoupled_part_count",
+					"next_stage_dry_mass",
+					"next_stage_propellant_mass",
+					"next_stage_parachute_count",
+					"next_stage_launch_clamp_count",
+				)
+			}
+			if current_stage > 0:
+				next_stage = current_stage - 1
+				parts = self.vessel.parts.all
+				activation_parts = [part for part in parts if part.stage == next_stage]
+				detached_parts = [part for part in parts if part.decouple_stage == next_stage]
+				info["next_stage_available"] = 1.0
+				for part in activation_parts:
+					engine = part.engine
+					if engine is not None:
+						info["next_stage_engine_count"] += 1
+						info["next_stage_vacuum_thrust"] += engine.max_vacuum_thrust * engine.thrust_limit
+					info["next_stage_parachute_count"] += int(part.parachute is not None)
+					info["next_stage_launch_clamp_count"] += int(part.launch_clamp is not None)
+				info["next_stage_decoupled_part_count"] = len(detached_parts)
+				info["next_stage_dry_mass"] = sum(part.dry_mass for part in detached_parts)
+				for part in detached_parts:
+					resources = part.resources
+					names = set(resources.names)
+					for name in ("LiquidFuel", "Oxidizer", "SolidFuel", "MonoPropellant"):
+						if name in names:
+							stream = self.conn.add_stream(resources.amount, name)
+							stream.rate = 10
+							self._stage_resource_streams.append((stream, self.sc.Resources.density(name)))
+			self._stage_info = info
+			self._stage_cache_key = current_stage
+		info = self._stage_info.copy()
+		info["next_stage_propellant_mass"] = sum(stream() * density for stream, density in self._stage_resource_streams)
+		return info
 
 	def read_observation(self):
 		observation = {name: stream() for name, stream in self.telemetry.items()}
+		observation["stage"] = self.control.current_stage
+		observation.update(self.read_next_stage(observation["stage"]))
 		observation["client_time"] = time.monotonic()
 		return observation
 
@@ -162,7 +222,10 @@ class KSPClient:
 			print("Revert to launch is unavailable.")
 
 	def close(self):
-		self.conn.close()
+		try:
+			self._clear_stage_streams()
+		finally:
+			self.conn.close()
 
 	def reset(self, delay=5.0, timeout=30.0):
 		self.stop_controls()
@@ -170,7 +233,7 @@ class KSPClient:
 		if not self.sc.can_revert_to_launch():
 			raise RuntimeError("Revert to launch is unavailable.")
 
-		# Remove streams attached to the previous flight.
+		self._clear_stage_streams()
 		for stream in self.telemetry.values():
 			stream.remove()
 
@@ -178,7 +241,6 @@ class KSPClient:
 
 		self.revert_to_launch(delay=delay)
 
-		# Wait for the launchpad flight to become available.
 		deadline = time.monotonic() + timeout
 
 		while time.monotonic() < deadline:

@@ -4,17 +4,22 @@ import numpy as np
 
 
 class KSPEnvironment:
-	def __init__(self, client, task="orbit", orbit_weight=10.0, fuel_weight=0.1, time_weight=5, episode_seconds=600.0, confirmation_seconds=5.0):
+	def __init__(self, client, task="orbit", orbit_weight=10.0, fuel_weight=5.0, time_weight=0.1, episode_seconds=600.0, confirmation_seconds=5.0, staging_reward_budget=0.1):
 		if task != "orbit":
 			raise ValueError("Only the orbit task is implemented currently.")
 		if not math.isfinite(episode_seconds) or episode_seconds <= 0:
 			raise ValueError("Episode duration must be finite and positive.")
 		if not math.isfinite(confirmation_seconds) or confirmation_seconds < 0:
 			raise ValueError("Confirmation duration must be finite and nonnegative.")
+		if not math.isfinite(staging_reward_budget) or staging_reward_budget < 0:
+			raise ValueError("Staging reward budget must be finite and nonnegative.")
 
 		self.client = client
 		self.task = task
 		self.stage_requested = False
+		self.staging_reward_budget = staging_reward_budget
+		self.staging_reward_paid = 0.0
+		self.rewarded_stages = set()
 
 		self.orbit_weight = orbit_weight
 		self.fuel_weight = fuel_weight
@@ -57,6 +62,7 @@ class KSPEnvironment:
 		self.gravity_scale = body.gravitational_parameter / self.radius_scale**2
 
 		self.mass_scale = max(observation["mass"], 1.0)
+		self.initial_stage_count = max(1, int(observation["stage"]))
 
 		self.resource_scales = {field: max(observation[field], 1.0) for field in ("liquid_fuel", "oxidizer", "solid_fuel", "monopropellant", "electric_charge")}
 
@@ -85,22 +91,26 @@ class KSPEnvironment:
 		activate_stage = requested and not self.stage_requested
 		self.stage_requested = requested
 
-		if activate_stage:
-			self.client.activate_next_stage()
-
+		staging_reward = 0.0
+		activated_stage = None
 		try:
+			if activate_stage:
+				activated_stage = self.client.activate_next_stage()
+				if activated_stage is not None and activated_stage not in self.rewarded_stages:
+					self.rewarded_stages.add(activated_stage)
+					remaining = max(0.0, self.staging_reward_budget - self.staging_reward_paid)
+					staging_reward = min(self.staging_reward_budget / self.initial_stage_count, remaining)
+					self.staging_reward_paid += staging_reward
 			observation = self.client.step(throttle=(throttle + 1.0) / 2.0, pitch=pitch, yaw=yaw, roll=roll, duration=duration, manual=True)
 
 		except Exception:
 			if self.client.vessel_exists():
-				# The craft still exists: don't disguise an unrelated error
-				# as a valid training transition.
 				raise
 
-			return self.end_failed_episode("spacecraft_destroyed")
+			return self.end_failed_episode("spacecraft_destroyed", staging_reward)
 
 		if not self.client.vessel_exists():
-			return self.end_failed_episode("spacecraft_destroyed")
+			return self.end_failed_episode("spacecraft_destroyed", staging_reward)
 
 		mass = float(observation["mass"])
 
@@ -108,12 +118,11 @@ class KSPEnvironment:
 			raise ValueError("Received non-finite spacecraft mass.")
 
 		if mass <= 0:
-			return self.end_failed_episode("spacecraft_mass_lost")
+			return self.end_failed_episode("spacecraft_mass_lost", staging_reward)
 
-		reward = self.calculate_reward(observation)
+		reward = self.calculate_reward(observation, staging_reward)
 		terminated, truncated, info = self.check_episode_end(observation)
 
-		# Add the task-specific success bonus or failure penalty.
 		terminal_reward = self.outcome_reward(info["end_reason"])
 		reward += terminal_reward
 		self.reward_components["outcome_reward"] = terminal_reward
@@ -125,6 +134,7 @@ class KSPEnvironment:
 
 		info["telemetry"] = observation.copy()
 		info["reward_components"] = self.reward_components.copy()
+		info["stage_activated"] = activated_stage
 
 		return state, reward, terminated, truncated, info
 
@@ -138,37 +148,26 @@ class KSPEnvironment:
 		if not (math.isfinite(apoapsis) and math.isfinite(periapsis)):
 			return None
 
-		apoapsis_progress = min(apoapsis / self.atmosphere_depth, 1.0)
-		periapsis_progress = min(periapsis / self.atmosphere_depth, 1.0)
+		height = self.atmosphere_depth
+		return (min(apoapsis, height) + min(periapsis, height)) / (2.0 * height)
 
-		return 0.5 * (apoapsis_progress + periapsis_progress)
-
-	def calculate_reward(self, observation):
+	def calculate_reward(self, observation, staging_reward=0.0):
 		current_progress = self.orbit_progress(observation)
 
-		progress_change = 0.0
-
-		if current_progress is not None:
-			if self.previous_orbit_progress is not None:
-				progress_change = current_progress - self.previous_orbit_progress
-
-			self.previous_orbit_progress = current_progress
-
-		previous_fuel = self.propellant_mass(self.previous_observation)
-		current_fuel = self.propellant_mass(observation)
-
-		fuel_spent = max(0.0, previous_fuel - current_fuel)
-		fuel_fraction_spent = fuel_spent / self.initial_propellant_mass
-
+		orbit_reward = 0.0
+		if current_progress is not None and self.previous_orbit_progress is not None:
+			orbit_reward = self.orbit_weight * (current_progress - self.previous_orbit_progress)
+		fuel_used = max(0.0, self.propellant_mass(self.previous_observation) - self.propellant_mass(observation))
+		fuel_penalty = self.fuel_weight * fuel_used / self.initial_propellant_mass
 		time_penalty = self.time_weight * observation["dt"] / self.episode_seconds
-		orbit_reward = self.orbit_weight * progress_change
-		fuel_penalty = self.fuel_weight * fuel_fraction_spent
 
-		self.reward_components = {"orbit_reward": orbit_reward, "fuel_penalty": fuel_penalty, "time_penalty": time_penalty, "outcome_reward": 0.0}
+		self.reward_components = {"orbit_reward": orbit_reward, "fuel_penalty": fuel_penalty, "time_penalty": time_penalty, "staging_reward": staging_reward, "outcome_reward": 0.0}
 
 		self.previous_observation = observation.copy()
+		if current_progress is not None:
+			self.previous_orbit_progress = current_progress
 
-		return orbit_reward - fuel_penalty - time_penalty
+		return orbit_reward - fuel_penalty - time_penalty + staging_reward
 
 	def check_episode_end(self, observation):
 		situations = self.client.sc.VesselSituation
@@ -189,7 +188,7 @@ class KSPEnvironment:
 			and 0.0 <= eccentricity < 1.0
 			and apoapsis > self.atmosphere_depth
 			and periapsis > self.atmosphere_depth
-			and 0.0 <= thrust < 1.0  # Effectively no thrust, in newtons
+			and 0.0 <= thrust < 1.0
 		)
 
 		if valid_orbit:
@@ -231,6 +230,8 @@ class KSPEnvironment:
 		observation = self.client.reset(delay=5.0)
 		self.initialize_observation_scales(observation)
 		self.stage_requested = False
+		self.staging_reward_paid = 0.0
+		self.rewarded_stages = set()
 		self.episode_start_ut = None
 		self.has_been_airborne = False
 		self.episode_finished = False
@@ -269,7 +270,6 @@ class KSPEnvironment:
 			if name != "eccentricity":
 				value /= self.atmosphere_depth
 
-			# Preserve sign while compressing extreme orbital values.
 			features[name] = math.copysign(math.log1p(abs(value)), value)
 
 		add_vector("position", observation["position"], self.radius_scale)
@@ -286,8 +286,6 @@ class KSPEnvironment:
 			raise ValueError("Orientation quaternion has zero length.")
 
 		rotation /= norm
-
-		# q and -q describe the same orientation.
 		if rotation[3] < 0:
 			rotation = -rotation
 
@@ -316,7 +314,6 @@ class KSPEnvironment:
 		for field, scale in self.resource_scales.items():
 			features[field] = observation[field] / scale
 
-		# Six is the initial staging count for our current Kerbal 1.
 		features["stage"] = observation["stage"] / 6.0
 		features["stage_requested"] = float(self.stage_requested)
 
@@ -328,6 +325,13 @@ class KSPEnvironment:
 		features["yaw_input"] = observation["yaw_input"]
 		features["roll_input"] = observation["roll_input"]
 
+		features["next_stage_available"] = observation["next_stage_available"]
+		for name in ("next_stage_engine_count", "next_stage_decoupled_part_count", "next_stage_parachute_count", "next_stage_launch_clamp_count"):
+			features[name] = math.log1p(observation[name])
+		features["next_stage_vacuum_twr"] = observation["next_stage_vacuum_thrust"] / (mass * self.gravity_scale)
+		features["next_stage_dry_mass_fraction"] = observation["next_stage_dry_mass"] / self.mass_scale
+		features["next_stage_propellant_mass_fraction"] = observation["next_stage_propellant_mass"] / self.mass_scale
+
 		state = np.asarray(list(features.values()), dtype=np.float32)
 
 		if not np.isfinite(state).all():
@@ -337,11 +341,12 @@ class KSPEnvironment:
 
 		return state
 
-	def end_failed_episode(self, reason):
+	def end_failed_episode(self, reason, staging_reward=0.0):
 		self.episode_finished = True
-		reward = self.outcome_reward(reason)
+		outcome_reward = self.outcome_reward(reason)
+		reward = outcome_reward + staging_reward
 
-		self.reward_components = {"orbit_reward": 0.0, "fuel_penalty": 0.0, "time_penalty": 0.0, "outcome_reward": reward}
+		self.reward_components = {"orbit_reward": 0.0, "fuel_penalty": 0.0, "time_penalty": 0.0, "staging_reward": staging_reward, "outcome_reward": outcome_reward}
 
 		info = {
 			"elapsed": self.client.sc.ut - self.episode_start_ut,
@@ -356,7 +361,7 @@ class KSPEnvironment:
 
 	def outcome_reward(self, reason):
 		if self.task == "orbit":
-			rewards = {"orbit_achieved": 10.0, "returned_to_surface": -10.0, "spacecraft_destroyed": -20.0, "spacecraft_mass_lost": -20.0, "time_limit": -20.0}
+			rewards = {"orbit_achieved": 10.0, "returned_to_surface": -10.0, "spacecraft_destroyed": -15.0, "spacecraft_mass_lost": -5.0, "time_limit": -20.0}
 
 			if reason is None:
 				return 0.0

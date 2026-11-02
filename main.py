@@ -55,7 +55,7 @@ def train(args):
 	run = None
 	completed = False
 	checkpoint = None
-	checkpoint_path = Path(args.checkpoint)
+	checkpoint_path = Path("models/", args.checkpoint)
 	if args.resume:
 		checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
 		for name in ("model", "optimizer", "observation_size", "completed_updates", "total_steps"):

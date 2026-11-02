@@ -4,9 +4,13 @@ import numpy as np
 
 
 class KSPEnvironment:
-	def __init__(self, client, task="orbit", orbit_weight=5.0, fuel_weight=0.1, time_weight=0.01, episode_seconds=600.0, confirmation_seconds=5.0):
+	def __init__(self, client, task="orbit", orbit_weight=10.0, fuel_weight=0.1, time_weight=5, episode_seconds=600.0, confirmation_seconds=5.0):
 		if task != "orbit":
 			raise ValueError("Only the orbit task is implemented currently.")
+		if not math.isfinite(episode_seconds) or episode_seconds <= 0:
+			raise ValueError("Episode duration must be finite and positive.")
+		if not math.isfinite(confirmation_seconds) or confirmation_seconds < 0:
+			raise ValueError("Confirmation duration must be finite and nonnegative.")
 
 		self.client = client
 		self.task = task
@@ -22,6 +26,7 @@ class KSPEnvironment:
 		self.has_been_airborne = False
 		self.episode_finished = False
 		self.orbit_valid_since = None
+		self.surface_valid_since = None
 
 		body = client.vessel.orbit.body
 		self.atmosphere_depth = body.atmosphere_depth
@@ -169,6 +174,7 @@ class KSPEnvironment:
 		situations = self.client.sc.VesselSituation
 		situation = observation["situation"]
 		ut = observation["ut"]
+		elapsed = ut - self.episode_start_ut
 
 		if situation in (situations.flying, situations.sub_orbital, situations.orbiting, situations.escaping):
 			self.has_been_airborne = True
@@ -192,14 +198,19 @@ class KSPEnvironment:
 		else:
 			self.orbit_valid_since = None
 
-		success = self.orbit_valid_since is not None and ut - self.orbit_valid_since >= self.confirmation_seconds
+		success = self.orbit_valid_since is not None and ut >= self.orbit_valid_since + self.confirmation_seconds
 
-		returned_to_surface = self.has_been_airborne and situation in (situations.landed, situations.splashed)
+		on_surface = self.has_been_airborne and situation in (situations.landed, situations.splashed)
+		if not on_surface:
+			self.surface_valid_since = None
+		elif self.surface_valid_since is None and elapsed <= self.episode_seconds:
+			self.surface_valid_since = ut
 
-		terminated = success or returned_to_surface
-
-		elapsed = ut - self.episode_start_ut
-		truncated = not terminated and elapsed >= self.episode_seconds
+		returned_to_surface = self.surface_valid_since is not None and ut >= self.surface_valid_since + self.confirmation_seconds
+		surface_confirmation_pending = self.surface_valid_since is not None and not returned_to_surface
+		timed_out = elapsed >= self.episode_seconds and not surface_confirmation_pending
+		terminated = success or returned_to_surface or timed_out
+		truncated = False
 
 		reason = None
 
@@ -207,10 +218,14 @@ class KSPEnvironment:
 			reason = "orbit_achieved"
 		elif returned_to_surface:
 			reason = "returned_to_surface"
-		elif truncated:
+		elif timed_out:
 			reason = "time_limit"
 
-		return terminated, truncated, {"elapsed": elapsed, "success": success, "end_reason": reason, "apoapsis": apoapsis, "periapsis": periapsis}
+		return (
+			terminated,
+			truncated,
+			{"elapsed": elapsed, "success": success, "end_reason": reason, "apoapsis": apoapsis, "periapsis": periapsis, "surface_confirmation_pending": surface_confirmation_pending},
+		)
 
 	def reset(self):
 		observation = self.client.reset(delay=5.0)
@@ -220,6 +235,7 @@ class KSPEnvironment:
 		self.has_been_airborne = False
 		self.episode_finished = False
 		self.orbit_valid_since = None
+		self.surface_valid_since = None
 
 		self.initial_propellant_mass = self.propellant_mass(observation)
 
@@ -340,7 +356,7 @@ class KSPEnvironment:
 
 	def outcome_reward(self, reason):
 		if self.task == "orbit":
-			rewards = {"orbit_achieved": 10.0, "returned_to_surface": -10.0, "spacecraft_destroyed": -20.0, "spacecraft_mass_lost": -20.0, "time_limit": -5.0}
+			rewards = {"orbit_achieved": 10.0, "returned_to_surface": -10.0, "spacecraft_destroyed": -20.0, "spacecraft_mass_lost": -20.0, "time_limit": -20.0}
 
 			if reason is None:
 				return 0.0

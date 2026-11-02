@@ -4,7 +4,7 @@ import numpy as np
 
 
 class KSPEnvironment:
-	def __init__(self, client, task="orbit", orbit_weight=1.0, fuel_weight=0.01, episode_seconds=600.0, confirmation_seconds=5.0):
+	def __init__(self, client, task="orbit", orbit_weight=5.0, fuel_weight=0.1, time_weight=0.01, episode_seconds=600.0, confirmation_seconds=5.0):
 		if task != "orbit":
 			raise ValueError("Only the orbit task is implemented currently.")
 
@@ -14,6 +14,7 @@ class KSPEnvironment:
 
 		self.orbit_weight = orbit_weight
 		self.fuel_weight = fuel_weight
+		self.time_weight = time_weight
 		self.episode_seconds = episode_seconds
 		self.confirmation_seconds = confirmation_seconds
 
@@ -154,14 +155,15 @@ class KSPEnvironment:
 		fuel_spent = max(0.0, previous_fuel - current_fuel)
 		fuel_fraction_spent = fuel_spent / self.initial_propellant_mass
 
+		time_penalty = self.time_weight * observation["dt"] / self.episode_seconds
 		orbit_reward = self.orbit_weight * progress_change
 		fuel_penalty = self.fuel_weight * fuel_fraction_spent
 
-		self.reward_components = {"orbit_reward": orbit_reward, "fuel_penalty": fuel_penalty, "outcome_reward": 0.0}
+		self.reward_components = {"orbit_reward": orbit_reward, "fuel_penalty": fuel_penalty, "time_penalty": time_penalty, "outcome_reward": 0.0}
 
 		self.previous_observation = observation.copy()
 
-		return orbit_reward - fuel_penalty
+		return orbit_reward - fuel_penalty - time_penalty
 
 	def check_episode_end(self, observation):
 		situations = self.client.sc.VesselSituation
@@ -323,7 +325,7 @@ class KSPEnvironment:
 		self.episode_finished = True
 		reward = self.outcome_reward(reason)
 
-		self.reward_components = {"orbit_reward": 0.0, "fuel_penalty": 0.0, "outcome_reward": reward}
+		self.reward_components = {"orbit_reward": 0.0, "fuel_penalty": 0.0, "time_penalty": 0.0, "outcome_reward": reward}
 
 		info = {
 			"elapsed": self.client.sc.ut - self.episode_start_ut,
@@ -338,7 +340,7 @@ class KSPEnvironment:
 
 	def outcome_reward(self, reason):
 		if self.task == "orbit":
-			rewards = {"orbit_achieved": 10.0, "returned_to_surface": -20.0, "spacecraft_destroyed": -20.0, "spacecraft_mass_lost": -20.0, "time_limit": 0.0}
+			rewards = {"orbit_achieved": 10.0, "returned_to_surface": -10.0, "spacecraft_destroyed": -20.0, "spacecraft_mass_lost": -20.0, "time_limit": -5.0}
 
 			if reason is None:
 				return 0.0

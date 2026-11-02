@@ -75,11 +75,12 @@ class KSPClient:
 				if self.root_part in vessel.parts.all:
 					return True
 
+			except self.conn.krpc.ObjectDestroyedException:
+				continue
 			except RuntimeError as exc:
 				if "The vessel has no parts" in str(exc):
 					continue
 
-				# Preserve unrelated server errors.
 				raise
 
 		return False
@@ -124,13 +125,29 @@ class KSPClient:
 		return before - 1 if after < before else None
 
 	def _clear_stage_streams(self):
-		for stream, _ in getattr(self, "_stage_resource_streams", []):
-			stream.remove()
+		streams = getattr(self, "_stage_resource_streams", [])
 		self._stage_resource_streams = []
 		self._stage_cache_key = None
 		self._stage_info = {}
+		for stream, _ in streams:
+			try:
+				stream.remove()
+			except (self.conn.krpc.ObjectDestroyedException, self.conn.krpc.StreamRemovedException):
+				pass
 
 	def read_next_stage(self, current_stage):
+		for attempt in range(3):
+			try:
+				info = self._read_next_stage(current_stage)
+				info["stage"] = current_stage
+				return info
+			except self.conn.krpc.ObjectDestroyedException:
+				self._clear_stage_streams()
+				if attempt == 2 or not self.vessel_exists():
+					raise
+				current_stage = self.control.current_stage
+
+	def _read_next_stage(self, current_stage):
 		if current_stage != self._stage_cache_key:
 			self._clear_stage_streams()
 			info = {

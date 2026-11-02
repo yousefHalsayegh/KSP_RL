@@ -4,7 +4,7 @@ import numpy as np
 
 
 class KSPEnvironment:
-	def __init__(self, client, task="orbit", orbit_weight=10.0, fuel_weight=5.0, time_weight=0.1, episode_seconds=600.0, confirmation_seconds=5.0, staging_reward_budget=0.1):
+	def __init__(self, client, task="orbit", orbit_weight=10.0, fuel_weight=5.0, time_weight=0.1, episode_seconds=600.0, confirmation_seconds=5.0, staging_reward_budget=0.1, airtime_weight=5.0):
 		if task != "orbit":
 			raise ValueError("Only the orbit task is implemented currently.")
 		if not math.isfinite(episode_seconds) or episode_seconds <= 0:
@@ -26,6 +26,7 @@ class KSPEnvironment:
 		self.time_weight = time_weight
 		self.episode_seconds = episode_seconds
 		self.confirmation_seconds = confirmation_seconds
+		self.airtime_weight = airtime_weight
 
 		self.episode_start_ut = None
 		self.has_been_airborne = False
@@ -160,14 +161,23 @@ class KSPEnvironment:
 		fuel_used = max(0.0, self.propellant_mass(self.previous_observation) - self.propellant_mass(observation))
 		fuel_penalty = self.fuel_weight * fuel_used / self.initial_propellant_mass
 		time_penalty = self.time_weight * observation["dt"] / self.episode_seconds
-
-		self.reward_components = {"orbit_reward": orbit_reward, "fuel_penalty": fuel_penalty, "time_penalty": time_penalty, "staging_reward": staging_reward, "outcome_reward": 0.0}
+		situations = self.client.sc.VesselSituation
+		airborne = observation["situation"] in (situations.flying, situations.sub_orbital, situations.orbiting, situations.escaping)
+		airtime_reward = self.airtime_weight * observation["dt"] / self.episode_seconds if airborne else 0.0
+		self.reward_components = {
+			"orbit_reward": orbit_reward,
+			"fuel_penalty": fuel_penalty,
+			"time_penalty": time_penalty,
+			"staging_reward": staging_reward,
+			"airtime_reward": airtime_reward,
+			"outcome_reward": 0.0,
+		}
 
 		self.previous_observation = observation.copy()
 		if current_progress is not None:
 			self.previous_orbit_progress = current_progress
 
-		return orbit_reward - fuel_penalty - time_penalty + staging_reward
+		return orbit_reward - fuel_penalty - time_penalty + staging_reward + airtime_reward
 
 	def check_episode_end(self, observation):
 		situations = self.client.sc.VesselSituation
@@ -346,7 +356,7 @@ class KSPEnvironment:
 		outcome_reward = self.outcome_reward(reason)
 		reward = outcome_reward + staging_reward
 
-		self.reward_components = {"orbit_reward": 0.0, "fuel_penalty": 0.0, "time_penalty": 0.0, "staging_reward": staging_reward, "outcome_reward": outcome_reward}
+		self.reward_components = {"orbit_reward": 0.0, "fuel_penalty": 0.0, "time_penalty": 0.0, "airtime_reward": 0.0, "staging_reward": staging_reward, "outcome_reward": outcome_reward}
 
 		info = {
 			"elapsed": self.client.sc.ut - self.episode_start_ut,

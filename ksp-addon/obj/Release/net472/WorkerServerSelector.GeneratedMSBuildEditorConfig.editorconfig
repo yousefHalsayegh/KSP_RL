@@ -1,0 +1,8 @@
+is_global = true
+build_property.RootNamespace = WorkerServerSelector
+build_property.ProjectDir = C:\Users\Yoyo\documents\github\ksp_rl\ksp-addon\
+build_property.EnableComHosting = 
+build_property.EnableGeneratedComInterfaceComImportInterop = 
+build_property.CsWinRTUseWindowsUIXamlProjections = false
+build_property.EffectiveAnalysisLevelStyle = 
+build_property.EnableCodeStyleSeverity = 

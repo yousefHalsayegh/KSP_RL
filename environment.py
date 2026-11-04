@@ -4,7 +4,7 @@ import numpy as np
 
 
 class KSPEnvironment:
-	def __init__(self, client, task="orbit", orbit_weight=10.0, fuel_weight=5.0, time_weight=0.1, episode_seconds=600.0, confirmation_seconds=5.0, staging_reward_budget=0.1, airtime_weight=5.0):
+	def __init__(self, client, task="orbit", orbit_weight=5.0, fuel_weight=5.0, time_weight=0.1, episode_seconds=600.0, confirmation_seconds=5.0, staging_reward_budget=1.0, airtime_weight=10.0):
 		if task != "orbit":
 			raise ValueError("Only the orbit task is implemented currently.")
 		if not math.isfinite(episode_seconds) or episode_seconds <= 0:
@@ -20,6 +20,9 @@ class KSPEnvironment:
 		self.staging_reward_budget = staging_reward_budget
 		self.staging_reward_paid = 0.0
 		self.rewarded_stages = set()
+		self.stationary_since = None
+		self.stationary_timeout = 10.0
+		self.stationary_speed = 0.5
 
 		self.orbit_weight = orbit_weight
 		self.fuel_weight = fuel_weight
@@ -184,6 +187,15 @@ class KSPEnvironment:
 		situation = observation["situation"]
 		ut = observation["ut"]
 		elapsed = ut - self.episode_start_ut
+		speed = float(observation["surface_speed"])
+		if not math.isfinite(speed) or speed < 0:
+			raise ValueError("Received invalid surface-relative speed.")
+
+		if speed <= self.stationary_speed:
+			if self.stationary_since is None:
+				self.stationary_since = ut
+		else:
+			self.stationary_since = None
 
 		if situation in (situations.flying, situations.sub_orbital, situations.orbiting, situations.escaping):
 			self.has_been_airborne = True
@@ -212,12 +224,12 @@ class KSPEnvironment:
 		on_surface = self.has_been_airborne and situation in (situations.landed, situations.splashed)
 		if not on_surface:
 			self.surface_valid_since = None
-		elif self.surface_valid_since is None and elapsed <= self.episode_seconds:
+		elif self.surface_valid_since is None:
 			self.surface_valid_since = ut
 
 		returned_to_surface = self.surface_valid_since is not None and ut >= self.surface_valid_since + self.confirmation_seconds
 		surface_confirmation_pending = self.surface_valid_since is not None and not returned_to_surface
-		timed_out = elapsed >= self.episode_seconds and not surface_confirmation_pending
+		timed_out = self.stationary_since is not None and ut >= self.stationary_since + self.stationary_timeout and not surface_confirmation_pending
 		terminated = success or returned_to_surface or timed_out
 		truncated = False
 
@@ -247,6 +259,7 @@ class KSPEnvironment:
 		self.episode_finished = False
 		self.orbit_valid_since = None
 		self.surface_valid_since = None
+		self.stationary_since = None
 
 		self.initial_propellant_mass = self.propellant_mass(observation)
 

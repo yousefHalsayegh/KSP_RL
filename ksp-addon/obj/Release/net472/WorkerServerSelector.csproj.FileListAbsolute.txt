@@ -1,0 +1,8 @@
+C:\Users\Yoyo\documents\github\ksp_rl\ksp-addon\bin\Release\net472\WorkerServerSelector.dll
+C:\Users\Yoyo\documents\github\ksp_rl\ksp-addon\bin\Release\net472\WorkerServerSelector.pdb
+C:\Users\Yoyo\documents\github\ksp_rl\ksp-addon\obj\Release\net472\WorkerServerSelector.csproj.AssemblyReference.cache
+C:\Users\Yoyo\documents\github\ksp_rl\ksp-addon\obj\Release\net472\WorkerServerSelector.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Yoyo\documents\github\ksp_rl\ksp-addon\obj\Release\net472\WorkerServerSelector.csproj.CoreCompileInputs.cache
+C:\Users\Yoyo\documents\github\ksp_rl\ksp-addon\obj\Release\net472\WorkerServerSelector.sourcelink.json
+C:\Users\Yoyo\documents\github\ksp_rl\ksp-addon\obj\Release\net472\WorkerServerSelector.dll
+C:\Users\Yoyo\documents\github\ksp_rl\ksp-addon\obj\Release\net472\WorkerServerSelector.pdb

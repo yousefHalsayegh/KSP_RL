@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "njvZRa+qvmE=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\Yoyo\\documents\\github\\ksp_rl\\ksp-addon\\WorkerServerSelector.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Yoyo\\.nuget\\packages\\microsoft.netframework.referenceassemblies\\1.0.3\\microsoft.netframework.referenceassemblies.1.0.3.nupkg.sha512",
+    "C:\\Users\\Yoyo\\.nuget\\packages\\microsoft.netframework.referenceassemblies.net472\\1.0.3\\microsoft.netframework.referenceassemblies.net472.1.0.3.nupkg.sha512"
+  ],
+  "logs": []
+}

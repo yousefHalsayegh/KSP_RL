@@ -4,8 +4,8 @@ import krpc  # type: ignore
 
 
 class KSPClient:
-	def __init__(self, name="KSP Client"):
-		self.conn = krpc.connect(name=name)
+	def __init__(self, name="KSP Client", connection=None):
+		self.conn = connection if connection is not None else krpc.connect(name=name)
 		self.sc = self.conn.space_center
 		self.telemetry = {}
 
@@ -210,11 +210,12 @@ class KSPClient:
 		while self.sc.ut - start_ut < duration:
 			if time.monotonic() >= deadline:
 				raise TimeoutError("Game time stopped advancing.")
-
 			time.sleep(0.01)
 
 		observation = self.read_observation()
-		observation["dt"] = observation["ut"] - start_ut
+		end_ut = self.sc.ut
+		observation["ut"] = end_ut
+		observation["dt"] = end_ut - start_ut
 		return observation
 
 	def stop_controls(self):

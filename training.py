@@ -1,5 +1,8 @@
-import argparse
+"""Shared-policy PPO training using already connected KSP workers."""
+
+import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -11,83 +14,214 @@ from client import KSPClient
 from environment import KSPEnvironment
 
 
-def parse_args():
-	parser = argparse.ArgumentParser()
+def reset_worker(worker):
+	worker["connection"].krpc.paused = False
+	state = worker["env"].reset()
+	worker["client"].manual_control()
+	if not np.all(np.isfinite(state)):
+		raise ValueError(f"Worker {worker['index']} returned an invalid reset state.")
+	return state.copy()
 
-	parser.add_argument("--mode", choices=["train", "test"], default="train")
-	parser.add_argument("--device", default="cuda")
-	parser.add_argument("--seed", type=int, default=0)
 
-	parser.add_argument("--updates", type=int, default=10, help="Updates to run in this session; additional updates when resuming.")
-	parser.add_argument("--rollout-steps", type=int, default=256)
-	parser.add_argument("--episode-seconds", type=float, default=200.0)
-	parser.add_argument("--epochs", type=int, default=10)
-	parser.add_argument("--batch-size", type=int, default=64)
-	parser.add_argument("--learning-rate", type=float, default=3e-4)
-	parser.add_argument("--gamma", type=float, default=0.99)
-	parser.add_argument("--gae-lambda", type=float, default=0.95)
-	parser.add_argument("--checkpoint", default="ppo_checkpoint.pt")
-	parser.add_argument("--resume", action="store_true", help="Continue from --checkpoint, restoring its training settings.")
+def step_worker(worker, action):
+	state, reward, terminated, truncated, info = worker["env"].step(action)
+	if not np.all(np.isfinite(state)) or not np.isfinite(reward):
+		raise ValueError(f"Worker {worker['index']} returned an invalid transition.")
+	# Preserve the final observation separately from the reset observation.
+	final_state = state.copy()
+	following_state = reset_worker(worker) if terminated or truncated else state.copy()
+	return final_state, float(reward), bool(terminated), bool(truncated), info, following_state
 
-	parser.add_argument("--wandb", action="store_true")
-	parser.add_argument("--wandb-project", default="ksp-rl")
-	parser.add_argument("--wandb-entity", default=None)
-	parser.add_argument("--wandb-name", default=None)
-	parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
-	parser.add_argument("--wandb-run-id", default=None, help="Existing W&B run ID, needed for older checkpoints without one.")
 
-	args = parser.parse_args()
+def collect_rollout(agent, workers, executor, steps, on_step=None):
+	count = len(workers)
+	size = agent.observation_size
+	actions = agent.log_std.numel()
+	rollout = {
+		"states": np.empty((steps, count, size), dtype=np.float32),
+		"raw_actions": np.empty((steps, count, actions), dtype=np.float32),
+		"old_log_probabilities": np.empty((steps, count), dtype=np.float32),
+		"rewards": np.empty((steps, count), dtype=np.float32),
+		"values": np.empty((steps, count), dtype=np.float32),
+		"next_values": np.full((steps, count), np.nan, dtype=np.float32),
+		"terminated": np.empty((steps, count), dtype=bool),
+		"truncated": np.empty((steps, count), dtype=bool),
+	}
+	agent.eval()
+	for t in range(steps):
+		# Existing act() accepts one state. All inference stays on the main thread.
+		decisions = [agent.act(worker["state"]) for worker in workers]
+		for i, (worker, decision) in enumerate(zip(workers, decisions)):
+			rollout["states"][t, i] = worker["state"]
+			rollout["raw_actions"][t, i] = decision["raw_action"]
+			rollout["old_log_probabilities"][t, i] = decision["log_probability"]
+			rollout["values"][t, i] = decision["value"]
+			if t > 0 and np.isnan(rollout["next_values"][t - 1, i]):
+				rollout["next_values"][t - 1, i] = decision["value"]
 
+		futures = [executor.submit(step_worker, worker, decision["action"]) for worker, decision in zip(workers, decisions)]
+		infos, finished = [], []
+		# Consume every future before starting the next batch of calls.
+		results, errors = [], []
+		for future in futures:
+			try:
+				results.append(future.result())
+			except Exception as error:
+				results.append(None)
+				errors.append(error)
+		if errors:
+			raise errors[0]
+
+		for i, (worker, result) in enumerate(zip(workers, results)):
+			final_state, reward, terminated, truncated, info, following_state = result
+			rollout["rewards"][t, i] = reward
+			rollout["terminated"][t, i] = terminated
+			rollout["truncated"][t, i] = truncated
+			if terminated:
+				rollout["next_values"][t, i] = 0.0
+			elif truncated:
+				# Bootstrap from the final state, never from the next episode.
+				rollout["next_values"][t, i] = agent.estimate_value(final_state)
+			worker["state"] = following_state
+			worker["episode_return"] += reward
+			worker["episode_steps"] += 1
+			infos.append(info)
+			if terminated or truncated:
+				finished.append(
+					{"worker": worker["index"], "return": worker["episode_return"], "length": worker["episode_steps"], "success": bool(info.get("success", False)), "reason": info.get("end_reason")}
+				)
+				worker["episode_return"] = 0.0
+				worker["episode_steps"] = 0
+		if on_step is not None:
+			on_step(rollout["rewards"][t], infos, finished)
+	return rollout
+
+
+def prepare_update(agent, workers, rollout, gamma, gae_lambda):
+	# Caller pauses all games before this function and the optimizer update.
+	for i, worker in enumerate(workers):
+		if np.isnan(rollout["next_values"][-1, i]):
+			rollout["next_values"][-1, i] = agent.estimate_value(worker["state"])
+
+	advantages, returns = [], []
+	for i in range(len(workers)):
+		worker_advantages, worker_returns = agent.compute_gae(
+			rewards=rollout["rewards"][:, i],
+			values=rollout["values"][:, i],
+			next_values=rollout["next_values"][:, i],
+			terminated=rollout["terminated"][:, i],
+			truncated=rollout["truncated"][:, i],
+			gamma=gamma,
+			gae_lambda=gae_lambda,
+		)
+		advantages.append(worker_advantages)
+		returns.append(worker_returns)
+
+	# Time-major order must match across every flattened array.
+	return {
+		"states": rollout["states"].reshape(-1, agent.observation_size),
+		"raw_actions": rollout["raw_actions"].reshape(-1, agent.log_std.numel()),
+		"old_log_probabilities": rollout["old_log_probabilities"].reshape(-1),
+		"advantages": torch.stack(advantages, dim=1).reshape(-1),
+		"returns": torch.stack(returns, dim=1).reshape(-1),
+	}
+
+
+def save_checkpoint(path, agent, env, args, counters, wandb_metadata):
+	numpy_rng = np.random.get_state()
+	payload = {
+		"model": agent.state_dict(),
+		"optimizer": agent.optimizer.state_dict(),
+		"observation_size": agent.observation_size,
+		"observation_names": env.observation_names,
+		"action_size": agent.log_std.numel(),
+		"hidden_size": agent.actor[0].out_features,
+		"wandb": wandb_metadata,
+		"config": vars(args).copy(),
+		"rng": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all() if agent.device.type == "cuda" else [], "numpy": [numpy_rng[0], numpy_rng[1].tolist(), *numpy_rng[2:]]},
+		**counters,
+	}
+	temporary = path.with_suffix(path.suffix + ".tmp")
+	torch.save(payload, temporary)
+	temporary.replace(path)
+
+
+def train(args, workers):
+	"""Train one policy; connections remain owned by the launcher."""
+	if not workers:
+		raise ValueError("At least one connected worker is required.")
+	if args.device.startswith("cuda") and not torch.cuda.is_available():
+		raise RuntimeError("CUDA was requested but is unavailable.")
 	if min(args.updates, args.rollout_steps, args.epochs, args.batch_size) <= 0:
-		parser.error("Updates, rollout steps, epochs and batch size must be positive.")
-	if args.wandb_run_id and not (args.resume and args.wandb):
-		parser.error("--wandb-run-id requires --resume and --wandb.")
-	if args.resume and args.wandb and args.wandb_mode != "online":
-		parser.error("This resume command requires --wandb-mode online to continue the existing W&B run.")
-	if args.resume and args.mode != "train":
-		parser.error("--resume is only supported in training mode.")
+		raise ValueError("Updates, rollout steps, epochs and batch size must be positive.")
 
-	return args
-
-
-def train(args):
-	client = None
-	run = None
-	completed = False
-	checkpoint = None
-	checkpoint_path = Path("models/", args.checkpoint)
-	if args.resume:
-		checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+	path = Path(args.checkpoint)
+	path.parent.mkdir(parents=True, exist_ok=True)
+	checkpoint = torch.load(path, map_location="cpu", weights_only=True) if args.resume else None
+	if checkpoint is not None:
 		for name in ("model", "optimizer", "observation_size", "completed_updates", "total_steps"):
 			if name not in checkpoint:
-				raise ValueError(f"Checkpoint is missing required field: {name}")
+				raise ValueError(f"Checkpoint is missing {name}.")
 		for name in ("seed", "rollout_steps", "episode_seconds", "epochs", "batch_size", "learning_rate", "gamma", "gae_lambda"):
 			if name in checkpoint.get("config", {}):
 				setattr(args, name, checkpoint["config"][name])
-	start_update = int(checkpoint["completed_updates"]) if checkpoint is not None else 0
-	end_update = start_update + args.updates
-	total_steps = int(checkpoint["total_steps"]) if checkpoint is not None else 0
-	episode_count = int(checkpoint.get("episode_count", 0)) if checkpoint is not None else 0
-	successful_episodes = int(checkpoint.get("successful_episodes", 0)) if checkpoint is not None else 0
-	wandb_metadata = dict(checkpoint.get("wandb") or {}) if checkpoint is not None else {}
-	wandb_step_offset = 0
-
-	if args.device.startswith("cuda") and not torch.cuda.is_available():
-		raise RuntimeError("CUDA was requested but is unavailable.")
+		if checkpoint.get("action_size", 5) != 5:
+			raise ValueError("Checkpoint must use five actions.")
 
 	np.random.seed(args.seed)
 	torch.manual_seed(args.seed)
-
+	saved = checkpoint or {}
+	total_steps = int(saved.get("total_steps", 0))
+	episode_count = int(saved.get("episode_count", 0))
+	successful_episodes = int(saved.get("successful_episodes", 0))
+	start_update = int(saved.get("completed_updates", 0))
+	elapsed = float(saved.get("elapsed_seconds", 0.0))
+	wandb_metadata = dict(saved.get("wandb") or {})
+	run, completed = None, False
 	try:
-		if args.wandb:
-			import wandb  # type: ignore
+		for worker in workers:
+			client = worker.get("client")
+			if client is None:
+				client = KSPClient(connection=worker["connection"])
+				worker["client"] = client
+			worker["connection"].krpc.paused = False
+			worker["env"] = KSPEnvironment(client, task="orbit", episode_seconds=args.episode_seconds)
+			worker["state"] = reset_worker(worker)
+			worker["episode_return"], worker["episode_steps"] = 0.0, 0
 
-			saved_run_id = wandb_metadata.get("id")
-			if saved_run_id and args.wandb_run_id and saved_run_id != args.wandb_run_id:
-				raise ValueError("--wandb-run-id differs from the run saved in the checkpoint.")
-			run_id = saved_run_id or args.wandb_run_id
-			if args.resume and not run_id and checkpoint.get("config", {}).get("wandb", False):
-				raise ValueError("This older checkpoint has no W&B ID. Supply --wandb-run-id from the existing run URL.")
+		env = workers[0]["env"]
+		for worker in workers:
+			if worker["env"].observation_names != env.observation_names:
+				raise ValueError("Workers have different observation layouts.")
+		agent = PPOAgent(observation_size=len(env.last_state), action_size=5, hidden_size=saved.get("hidden_size", 64), device=args.device, learning_rate=args.learning_rate)
+		if checkpoint is not None:
+			expanded = agent.load_training_state(checkpoint, env.observation_names, expand_observations=args.expand_observations)
+			if expanded:
+				backup = path.with_name(path.stem + ".before-stage-inputs" + path.suffix)
+				if not backup.exists():
+					shutil.copy2(path, backup)
+			args.learning_rate = agent.optimizer.param_groups[0]["lr"]
+			rng = saved.get("rng", {})
+			if "torch" in rng:
+				torch.set_rng_state(rng["torch"])
+			if "numpy" in rng:
+				state = rng["numpy"]
+				np.random.set_state((state[0], np.asarray(state[1], dtype=np.uint32), *state[2:]))
+			if agent.device.type == "cuda" and rng.get("cuda"):
+				if len(rng["cuda"]) == torch.cuda.device_count():
+					torch.cuda.set_rng_state_all(rng["cuda"])
+
+		wandb_offset = 0
+		if args.wandb:
+			import wandb
+
+			run_id = wandb_metadata.get("id") or args.wandb_run_id
+			if run_id and not args.resume:
+				raise ValueError("Continuing a W&B run requires --resume.")
+			if args.resume and args.wandb_mode != "online":
+				raise ValueError("W&B resume requires online mode.")
+			if args.resume and not run_id and saved.get("config", {}).get("wandb", False):
+				raise ValueError("Checkpoint has no W&B ID; supply --wandb-run-id.")
 			run = wandb.init(
 				project=wandb_metadata.get("project") or args.wandb_project,
 				entity=wandb_metadata.get("entity") or args.wandb_entity,
@@ -98,337 +232,105 @@ def train(args):
 				resume="must" if run_id else None,
 			)
 			wandb_metadata = {"id": run.id, "project": run.project, "entity": run.entity}
-			wandb_step_offset = max(0, int(run.step) - total_steps)
+			wandb_offset = max(0, int(run.step) - total_steps)
 
-		client = KSPClient(name="Custom PPO Training")
-
-		env = KSPEnvironment(client, task="orbit", episode_seconds=args.episode_seconds)
-
-		if checkpoint is not None:
-			if checkpoint.get("action_size", 5) != 5:
-				raise ValueError("Checkpoint does not use this environment's five-action layout.")
-
-		agent = PPOAgent(
-			observation_size=len(env.last_state),
-			action_size=checkpoint.get("action_size", 5) if checkpoint is not None else 5,
-			hidden_size=checkpoint.get("hidden_size", 64) if checkpoint is not None else 64,
-			device=args.device,
-			learning_rate=args.learning_rate,
-		)
-		if checkpoint is not None:
-			agent.load_state_dict(checkpoint["model"])
-			agent.optimizer.load_state_dict(checkpoint["optimizer"])
-			args.learning_rate = agent.optimizer.param_groups[0]["lr"]
-			state = env.reset()
-			rng = checkpoint.get("rng", {})
-			if "torch" in rng:
-				torch.set_rng_state(rng["torch"])
-			if "numpy" in rng:
-				numpy_rng = rng["numpy"]
-				np.random.set_state((numpy_rng[0], np.asarray(numpy_rng[1], dtype=np.uint32), *numpy_rng[2:]))
-			if agent.device.type == "cuda" and rng.get("cuda"):
-				if len(rng["cuda"]) == torch.cuda.device_count():
-					torch.cuda.set_rng_state_all(rng["cuda"])
-				else:
-					print("CUDA device count changed; CUDA random states were not restored.")
-			print(f"Resumed {checkpoint_path}: {start_update} completed updates, {total_steps} environment steps.")
-			if "episode_count" not in checkpoint:
-				print("Older checkpoint has no episode totals; episode count and success rate restart from zero.")
-		else:
-			state = env.last_state.copy()
-
-		needs_reset = False
-
-		episode_return = 0.0
-		episode_steps = 0
-
-		checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-		collection_start = time.perf_counter()
-
-		reset_seconds = 0.0
-		env_step_seconds = 0.0
-		action_inference_seconds = 0.0
-		simulated_seconds = 0.0
-
-		reset_count = 0
-		bootstrap_evaluations = 0
-
-		previous_ut = client.telemetry["ut"]()
-
-		elapsed_seconds = float(checkpoint.get("elapsed_seconds", 0.0)) if checkpoint is not None else 0.0
-		training_start = time.monotonic() - elapsed_seconds
-
-		print("Training starts")
-
-		with tqdm(total=args.updates * args.rollout_steps, desc="Collecting", unit="step", dynamic_ncols=True) as progress:
-			for update_index in range(start_update, end_update):
-				rollout = {name: [] for name in ("states", "raw_actions", "old_log_probabilities", "rewards", "values", "next_values", "terminated", "truncated")}
+		training_start = time.monotonic() - elapsed
+		samples_per_update = args.rollout_steps * len(workers)
+		print(f"Shared {agent.device} policy; {samples_per_update} transitions per update.")
+		with ThreadPoolExecutor(max_workers=len(workers)) as executor, tqdm(total=args.updates * samples_per_update, desc="Collecting", unit="transition") as progress:
+			for update_index in range(start_update, start_update + args.updates):
+				collection_start = time.perf_counter()
 				finished_episodes = []
 
-				collection_start = time.perf_counter()
-
-				reset_seconds = 0.0
-				env_step_seconds = 0.0
-				action_inference_seconds = 0.0
-				simulated_seconds = 0.0
-
-				reset_count = 0
-				bootstrap_evaluations = 0
-
-				previous_ut = client.telemetry["ut"]()
-
-				# ----------------------------------------------------------
-				# Collect a rollout with a fixed policy.
-				# ----------------------------------------------------------
-				for _ in range(args.rollout_steps):
-					if needs_reset:
-						reset_start = time.perf_counter()
-
-						state = env.reset()
-
-						reset_seconds += time.perf_counter() - reset_start
-						reset_count += 1
-						needs_reset = False
-
-						previous_ut = env.previous_observation["ut"]
-
-					inference_start = time.perf_counter()
-
-					result = agent.act(state)
-
-					action_inference_seconds += time.perf_counter() - inference_start
-
-					if rollout["next_values"] and rollout["next_values"][-1] is None:
-						rollout["next_values"][-1] = result["value"]
-
-					step_start = time.perf_counter()
-
-					next_state, reward, terminated, truncated, info = env.step(result["action"])
-
-					env_step_seconds += time.perf_counter() - step_start
-
-					if not info.get("telemetry_stale", False):
-						current_ut = info["telemetry"]["ut"]
-
-						simulated_seconds += max(0.0, current_ut - previous_ut)
-
-						previous_ut = current_ut
-
-					if terminated:
-						next_value = 0.0
-
-					elif truncated:
-						next_value = agent.estimate_value(next_state)
-						bootstrap_evaluations += 1
-
-					else:
-						next_value = None
-
-					rollout["states"].append(state.copy())
-					rollout["raw_actions"].append(result["raw_action"].copy())
-					rollout["old_log_probabilities"].append(result["log_probability"])
-					rollout["rewards"].append(float(reward))
-					rollout["values"].append(result["value"])
-					rollout["next_values"].append(next_value)
-					rollout["terminated"].append(bool(terminated))
-					rollout["truncated"].append(bool(truncated))
-
-					state = next_state.copy()
-					needs_reset = terminated or truncated
-
-					total_steps += 1
-					if run is not None:
-						metrics = {"rollout/reward": reward, "train/environment_steps": total_steps, "train/elapsed_seconds": time.monotonic() - training_start}
-						for name, value in info["reward_components"].items():
-							metrics[f"reward/{name}"] = -float(value) if name.endswith("_penalty") else float(value)
-						if not info.get("telemetry_stale", False):
-							telemetry = info.get("telemetry", {})
-							for name in ("altitude", "apoapsis", "periapsis", "mass"):
-								if name in telemetry:
-									metrics[f"telemetry/{name}"] = telemetry[name]
-						run.log(metrics, step=total_steps + wandb_step_offset, commit=False)
-
-					episode_steps += 1
-					episode_return += float(reward)
-
-					if needs_reset:
+				def on_step(rewards, infos, finished):
+					nonlocal total_steps, episode_count, successful_episodes
+					total_steps += len(workers)
+					finished_episodes.extend(finished)
+					log = {"train/environment_steps": total_steps, "train/elapsed_seconds": time.monotonic() - training_start, "rollout/reward": float(np.mean(rewards))}
+					names = set().union(*(info.get("reward_components", {}) for info in infos))
+					for name in names:
+						value = np.mean([info.get("reward_components", {}).get(name, 0.0) for info in infos])
+						log[f"reward/{name}"] = -float(value) if name.endswith("_penalty") else float(value)
+					for episode in finished:
 						episode_count += 1
+						successful_episodes += int(episode["success"])
+						tqdm.write(f"Worker {episode['worker']} episode: {episode['reason']} | return={episode['return']:.3f} | length={episode['length']}")
+					if finished:
+						log.update(
+							{
+								"episode/return_mean": float(np.mean([e["return"] for e in finished])),
+								"episode/length_mean": float(np.mean([e["length"] for e in finished])),
+								"episode/success_rate": successful_episodes / episode_count,
+								"train/episodes": episode_count,
+							}
+						)
+					if run is not None:
+						run.log(log, step=total_steps + wandb_offset)
+					progress.update(len(workers))
 
-						successful_episodes += int(info.get("success", False))
-						if run is not None:
-							run.log(
-								{"episode/return": episode_return, "episode/length": episode_steps, "episode/success_rate": successful_episodes / episode_count},
-								step=total_steps + wandb_step_offset,
-								commit=False,
-							)
-
-						finished_episodes.append({"return": episode_return, "length": episode_steps, "success": bool(info.get("success", False))})
-
-						tqdm.write(f"Episode {episode_count}: {info['end_reason']} | Return={episode_return:.4f} | Steps={episode_steps}")
-
-						episode_return = 0.0
-						episode_steps = 0
-
-					progress.set_postfix(update=f"{update_index + 1}/{end_update}", episodes=episode_count, reward=f"{reward:.4f}", refresh=False)
-					progress.update(1)
-
+				rollout = collect_rollout(agent, workers, executor, args.rollout_steps, on_step)
 				collection_seconds = time.perf_counter() - collection_start
-
-				# ----------------------------------------------------------
-				# Pause for bootstrapping, GAE, optimization and logging.
-				# ----------------------------------------------------------
-				client.conn.krpc.paused = True
-
 				try:
+					for worker in workers:
+						worker["connection"].krpc.paused = True
 					progress.set_description("Updating PPO")
-
 					if agent.device.type == "cuda":
 						torch.cuda.synchronize(agent.device)
-
 					update_start = time.perf_counter()
-
-					if rollout["next_values"][-1] is None:
-						rollout["next_values"][-1] = agent.estimate_value(state)
-						bootstrap_evaluations += 1
-
-					advantages, returns = agent.compute_gae(
-						rewards=rollout["rewards"],
-						values=rollout["values"],
-						next_values=rollout["next_values"],
-						terminated=rollout["terminated"],
-						truncated=rollout["truncated"],
-						gamma=args.gamma,
-						gae_lambda=args.gae_lambda,
-					)
-
-					metrics = agent.update(
-						states=rollout["states"],
-						raw_actions=rollout["raw_actions"],
-						old_log_probabilities=(rollout["old_log_probabilities"]),
-						advantages=advantages,
-						returns=returns,
-						epochs=args.epochs,
-						batch_size=args.batch_size,
-					)
-
+					batch = prepare_update(agent, workers, rollout, args.gamma, args.gae_lambda)
+					metrics = agent.update(**batch, epochs=args.epochs, batch_size=args.batch_size)
 					if agent.device.type == "cuda":
 						torch.cuda.synchronize(agent.device)
-
 					update_seconds = time.perf_counter() - update_start
-
-					numpy_rng = np.random.get_state()
-					temporary_checkpoint = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
-					torch.save(
+					save_checkpoint(
+						path,
+						agent,
+						env,
+						args,
 						{
-							"model": agent.state_dict(),
-							"optimizer": agent.optimizer.state_dict(),
-							"observation_size": agent.observation_size,
-							"observation_names": env.observation_names,
-							"action_size": agent.log_std.numel(),
-							"hidden_size": agent.actor[0].out_features,
 							"total_steps": total_steps,
 							"completed_updates": update_index + 1,
 							"episode_count": episode_count,
 							"successful_episodes": successful_episodes,
 							"elapsed_seconds": time.monotonic() - training_start,
-							"wandb": wandb_metadata,
-							"rng": {
-								"torch": torch.get_rng_state(),
-								"cuda": torch.cuda.get_rng_state_all() if agent.device.type == "cuda" else [],
-								"numpy": [numpy_rng[0], numpy_rng[1].tolist(), *numpy_rng[2:]],
-							},
-							"config": vars(args),
+							"worker_count": len(workers),
 						},
-						temporary_checkpoint,
+						wandb_metadata,
 					)
-					temporary_checkpoint.replace(checkpoint_path)
-
-					log_data = {
-						"train/update": update_index + 1,
-						"train/episodes": episode_count,
-						"train/environment_steps": total_steps,
-						"train/elapsed_seconds": time.monotonic() - training_start,
-						"train/update_seconds": update_seconds,
-						"rollout/reward_mean": float(np.mean(rollout["rewards"])),
-						"rollout/reset_count": reset_count,
-						"rollout/bootstrap_evaluations": (bootstrap_evaluations),
-						**{f"ppo/{name}": value for name, value in metrics.items() if value is not None},
-					}
-
 					if run is not None:
-						run.log(log_data, step=total_steps + wandb_step_offset)
-
-					tqdm.write(
-						f"Update {update_index + 1}: "
-						f"policy={metrics['policy_loss']:.4f}, "
-						f"value={metrics['value_loss']:.4f}, "
-						f"KL={metrics['approx_kl']:.5f}, "
-						f"collection={collection_seconds:.2f}s, "
-						f"reset={reset_seconds:.2f}s, "
-						f"update={update_seconds:.2f}s"
-					)
-
+						run.log(
+							{
+								"train/update": update_index + 1,
+								"train/environment_steps": total_steps,
+								"train/elapsed_seconds": time.monotonic() - training_start,
+								"train/update_seconds": update_seconds,
+								"rollout/collection_seconds": collection_seconds,
+								"rollout/reward_mean": float(rollout["rewards"].mean()),
+								"rollout/episodes_finished": len(finished_episodes),
+								**{f"ppo/{name}": value for name, value in metrics.items() if value is not None},
+							},
+							step=total_steps + wandb_offset + 1,
+						)
+						# Reserve the history step used by the update log.
+						wandb_offset += 1
+					tqdm.write(f"Update {update_index + 1}: samples={samples_per_update} | collection={collection_seconds:.1f}s | update={update_seconds:.2f}s")
 				finally:
-					client.conn.krpc.paused = False
+					for worker in workers:
+						worker["connection"].krpc.paused = False
 					progress.set_description("Collecting")
 		completed = True
-
 	except KeyboardInterrupt:
-		tqdm.write("Training interrupted; latest completed update is saved.")
-
+		tqdm.write("Interrupted; the latest completed-update checkpoint is preserved.")
 	finally:
-		try:
+		for worker in workers:
+			client = worker.get("client")
 			if client is not None:
 				try:
+					worker["connection"].krpc.paused = False
 					client.stop_controls()
-				finally:
-					try:
-						client.conn.krpc.paused = False
-						client.revert_to_launch(delay=5)
-					finally:
-						client.close()
-		finally:
-			if run is not None:
-				run.finish(exit_code=0 if completed else 1)
-
-
-def test():
-	connection = KSPClient(name="Environment Reward Test")
-
-	try:
-		env = KSPEnvironment(connection, task="orbit", episode_seconds=10)
-		state = env.reset()
-		agent = PPOAgent(observation_size=len(state))
-		result = agent.act(state)
-		print(result)
-		print("Launching in 5 seconds. Switch to KSP.")
-		time.sleep(5)
-		for episode in range(2):
-			print(f"\nEpisode {episode + 1}")
-
-			while True:
-				state, reward, terminated, truncated, info = env.step(result["action"])
-				observation = info["telemetry"]
-
-				print(f"State size: {len(state)} | Altitude: {observation['altitude']:.1f}m | Reward: {reward:+.6f}")
-
-				if terminated or truncated:
-					print(f"Episode ended: {info['end_reason']}")
-					break
-
-			state = env.reset()
-			print("Reset complete.")
-	except KeyboardInterrupt:
-		print("Test interrupted.")
-
-
-def main():
-	args = parse_args()
-	if args.mode == "test":
-		test()
-	else:
-		train(args)
-
-
-if __name__ == "__main__":
-	main()
+					if client.sc.can_revert_to_launch():
+						client.reset()
+				except Exception as error:
+					tqdm.write(f"Worker {worker['index']} cleanup failed: {error}")
+		if run is not None:
+			run.finish(exit_code=0 if completed else 1)

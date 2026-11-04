@@ -3,6 +3,7 @@ client.py
 environment.py
 main.py
 pyproject.toml
+training.py
 ksp_rl.egg-info/PKG-INFO
 ksp_rl.egg-info/SOURCES.txt
 ksp_rl.egg-info/dependency_links.txt

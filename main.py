@@ -2,10 +2,18 @@ import argparse
 import ctypes
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 from pathlib import Path
 
 import krpc
+import numpy as np
+import torch
+
+from agent import PPOAgent
+from client import KSPClient
+from environment import KSPEnvironment
+from training import train
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 WindowCallback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -87,19 +95,43 @@ def position_windows(workers, args):
 		print(f"Positioned worker {index} at ({x}, {y})")
 
 
-def launch_games(args):
+def launch_games(args, workers):
 	executable = Path(args.ksp).expanduser().resolve()
 	if not executable.is_file():
 		raise FileNotFoundError(f"KSP executable not found: {executable}")
 
-	workers = []
-
 	for index in range(args.instances):
-		command = [str(executable), "-screen-fullscreen", "0", "-screen-width", str(args.width), "-screen-height", str(args.height), f"--ksp-rl-server=RL-{index}"]
-		process = subprocess.Popen(command, cwd=executable.parent)
-		workers.append({"index": index, "process": process})
-		print(f"Started worker {index}: PID {process.pid}")
+		started = time.monotonic()
+		rpc_port = args.base_rpc_port + 2 * index
+		stream_port = rpc_port + 1
+		command = [
+			str(executable),
+			"-screen-fullscreen",
+			"0",
+			"-screen-width",
+			str(args.width),
+			"-screen-height",
+			str(args.height),
+			f"--ksp-rl-server=RL-{index}",
+			f"--ksp-rl-rpc-port={rpc_port}",
+			f"--ksp-rl-stream-port={stream_port}",
+		]
 
+		print(f"\nLaunching worker {index}...")
+		process = subprocess.Popen(command, cwd=executable.parent)
+		worker = {"index": index, "process": process}
+		workers.append(worker)
+
+		# These existing functions now prepare only this worker.
+		connect_games([worker], args)
+		wait_for_flights([worker], timeout=args.connection_timeout)
+		position_windows([worker], args)
+
+		# Hold prepared games while the remaining games load.
+		worker["connection"].krpc.paused = True
+
+		elapsed = time.monotonic() - started
+		print(f"Worker {index} ready after {elapsed:.1f} seconds.")
 	return workers
 
 
@@ -150,26 +182,46 @@ def main():
 	parser.add_argument("--startup-timeout", type=float, default=240.0)
 	parser.add_argument("--base-rpc-port", type=int, default=50000)
 	parser.add_argument("--connection-timeout", type=float, default=900.0)
+	parser.add_argument("--device", default="cuda")
+	parser.add_argument("--test-steps", type=int, default=100)
+	parser.add_argument("--seed", type=int, default=0)
+	parser.add_argument("--updates", type=int, default=10)
+	parser.add_argument("--rollout-steps", type=int, default=256)
+	parser.add_argument("--episode-seconds", type=float, default=600.0)
+	parser.add_argument("--epochs", type=int, default=10)
+	parser.add_argument("--batch-size", type=int, default=64)
+	parser.add_argument("--learning-rate", type=float, default=3e-4)
+	parser.add_argument("--gamma", type=float, default=0.99)
+	parser.add_argument("--gae-lambda", type=float, default=0.95)
+	parser.add_argument("--checkpoint", default="ppo_parallel.pt")
+	parser.add_argument("--resume", action="store_true")
+	parser.add_argument("--expand-observations", action="store_true")
+	parser.add_argument("--wandb", action="store_true")
+	parser.add_argument("--wandb-project", default="ksp-rl")
+	parser.add_argument("--wandb-entity", default=None)
+	parser.add_argument("--wandb-name", default=None)
+	parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
+	parser.add_argument("--wandb-run-id", default=None)
 	args = parser.parse_args()
 
 	if min(args.instances, args.width, args.height, args.startup_timeout) <= 0:
 		parser.error("Instance count, dimensions and timeout must be positive.")
 
-	workers = launch_games(args)
+	workers = []
+
 	try:
-		connect_games(workers, args)
-		print("\n All games connected successfully.")
-		wait_for_flights(workers, timeout=args.connection_timeout)
-		position_windows(workers, args)
-		input("Press Enter to disconnect Python. The games will stay open...")
+		launch_games(args, workers)
+
+		train(args, workers)
+
 	finally:
 		for worker in workers:
 			connection = worker.get("connection")
-			if connection.krpc.paused:
-				connection.krpc.paused = False
-				print(f"Unpaused worker {worker['index']}")
-			if connection.krpc.paused:
-				raise RuntimeError(f"Worker {worker['index']} is still paused")
+			if connection is not None:
+				try:
+					connection.krpc.paused = False
+				finally:
+					connection.close()
 
 
 if __name__ == "__main__":

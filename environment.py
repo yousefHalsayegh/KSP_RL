@@ -4,15 +4,19 @@ import numpy as np
 
 
 class KSPEnvironment:
-	def __init__(self, client, task="orbit", orbit_weight=5.0, fuel_weight=5.0, time_weight=0.1, episode_seconds=600.0, confirmation_seconds=5.0, staging_reward_budget=1.0, airtime_weight=10.0):
-		if task != "orbit":
-			raise ValueError("Only the orbit task is implemented currently.")
-		if not math.isfinite(episode_seconds) or episode_seconds <= 0:
-			raise ValueError("Episode duration must be finite and positive.")
-		if not math.isfinite(confirmation_seconds) or confirmation_seconds < 0:
-			raise ValueError("Confirmation duration must be finite and nonnegative.")
-		if not math.isfinite(staging_reward_budget) or staging_reward_budget < 0:
-			raise ValueError("Staging reward budget must be finite and nonnegative.")
+	def __init__(
+		self,
+		client,
+		task="orbit",
+		orbit_weight=5.0,
+		fuel_weight=5.0,
+		time_weight=0.1,
+		episode_seconds=600.0,
+		confirmation_seconds=5.0,
+		staging_reward_budget=1.0,
+		airtime_weight=10.0,
+		altitude_reward_per_step=0.1,
+	):
 
 		self.client = client
 		self.task = task
@@ -39,6 +43,8 @@ class KSPEnvironment:
 
 		body = client.vessel.orbit.body
 		self.atmosphere_depth = body.atmosphere_depth
+		self.altitude_step_m = self.atmosphere_depth / 20.0
+		self.altitude_reward_per_step = altitude_reward_per_step
 
 		resource_names = {"liquid_fuel": "LiquidFuel", "oxidizer": "Oxidizer", "solid_fuel": "SolidFuel", "monopropellant": "MonoPropellant"}
 
@@ -47,11 +53,10 @@ class KSPEnvironment:
 		initial = client.read_observation()
 		self.initialize_observation_scales(initial)
 		self.last_state = self.encode_observation(initial)
+		self.previous_altitude_band = self.altitude_band(initial["altitude"])
+		self.highest_altitude_band = self.previous_altitude_band
 
 		self.initial_propellant_mass = self.propellant_mass(initial)
-
-		if self.initial_propellant_mass <= 0:
-			raise ValueError("The spacecraft has no measured propellant.")
 
 		self.previous_observation = initial.copy()
 		self.previous_orbit_progress = self.orbit_progress(initial)
@@ -69,6 +74,10 @@ class KSPEnvironment:
 		self.initial_stage_count = max(1, int(observation["stage"]))
 
 		self.resource_scales = {field: max(observation[field], 1.0) for field in ("liquid_fuel", "oxidizer", "solid_fuel", "monopropellant", "electric_charge")}
+
+	def altitude_band(self, altitude):
+		altitude = max(0.0, float(altitude))
+		return min(10, math.floor(altitude / self.altitude_step_m))
 
 	def step(self, action, duration=0.2):
 		"""
@@ -167,12 +176,23 @@ class KSPEnvironment:
 		situations = self.client.sc.VesselSituation
 		airborne = observation["situation"] in (situations.flying, situations.sub_orbital, situations.orbiting, situations.escaping)
 		airtime_reward = self.airtime_weight * observation["dt"] / self.episode_seconds if airborne else 0.0
+		current_band = self.altitude_band(observation["altitude"])
+
+		new_bands = max(0, current_band - self.highest_altitude_band)
+		lost_bands = max(0, self.previous_altitude_band - current_band)
+
+		altitude_reward = (new_bands - lost_bands) * self.altitude_reward_per_step
+
+		self.highest_altitude_band = max(self.highest_altitude_band, current_band)
+		self.previous_altitude_band = current_band
+
 		self.reward_components = {
 			"orbit_reward": orbit_reward,
 			"fuel_penalty": fuel_penalty,
 			"time_penalty": time_penalty,
 			"staging_reward": staging_reward,
 			"airtime_reward": airtime_reward,
+			"altitude_reward": altitude_reward,
 			"outcome_reward": 0.0,
 		}
 
@@ -180,7 +200,7 @@ class KSPEnvironment:
 		if current_progress is not None:
 			self.previous_orbit_progress = current_progress
 
-		return orbit_reward - fuel_penalty - time_penalty + staging_reward + airtime_reward
+		return orbit_reward - fuel_penalty - time_penalty + staging_reward + airtime_reward + altitude_reward
 
 	def check_episode_end(self, observation):
 		situations = self.client.sc.VesselSituation
@@ -251,6 +271,8 @@ class KSPEnvironment:
 	def reset(self):
 		observation = self.client.reset(delay=5.0)
 		self.initialize_observation_scales(observation)
+		self.previous_altitude_band = self.altitude_band(observation["altitude"])
+		self.highest_altitude_band = self.previous_altitude_band
 		self.stage_requested = False
 		self.staging_reward_paid = 0.0
 		self.rewarded_stages = set()
@@ -369,7 +391,15 @@ class KSPEnvironment:
 		outcome_reward = self.outcome_reward(reason)
 		reward = outcome_reward + staging_reward
 
-		self.reward_components = {"orbit_reward": 0.0, "fuel_penalty": 0.0, "time_penalty": 0.0, "airtime_reward": 0.0, "staging_reward": staging_reward, "outcome_reward": outcome_reward}
+		self.reward_components = {
+			"orbit_reward": 0.0,
+			"fuel_penalty": 0.0,
+			"time_penalty": 0.0,
+			"airtime_reward": 0.0,
+			"altitude_reward": 0,
+			"staging_reward": staging_reward,
+			"outcome_reward": outcome_reward,
+		}
 
 		info = {
 			"elapsed": self.client.sc.ut - self.episode_start_ut,

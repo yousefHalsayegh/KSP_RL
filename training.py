@@ -2,7 +2,7 @@
 
 import shutil
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +12,23 @@ from tqdm import tqdm
 from agent import PPOAgent
 from client import KSPClient
 from environment import KSPEnvironment
+
+
+def restore_training_state(agent, checkpoint, observation_names, expand_observations=False):
+	loader = getattr(agent, "load_training_state", None)
+	if loader is not None:
+		return loader(checkpoint, observation_names, expand_observations=expand_observations)
+
+	# Older local agent.py versions expose only standard PyTorch loading methods.
+	names = list(observation_names)
+	if int(checkpoint["observation_size"]) != agent.observation_size:
+		raise ValueError("Checkpoint observation size changed. Restore the agent's observation-migration method before expanding an older checkpoint.")
+	saved_names = checkpoint.get("observation_names")
+	if saved_names is not None and list(saved_names) != names:
+		raise ValueError("Checkpoint observation names/order do not match the environment.")
+	agent.load_state_dict(checkpoint["model"])
+	agent.optimizer.load_state_dict(checkpoint["optimizer"])
+	return False
 
 
 def reset_worker(worker):
@@ -48,32 +65,31 @@ def collect_rollout(agent, workers, executor, steps, on_step=None):
 		"truncated": np.empty((steps, count), dtype=bool),
 	}
 	agent.eval()
-	for t in range(steps):
-		# Existing act() accepts one state. All inference stays on the main thread.
-		decisions = [agent.act(worker["state"]) for worker in workers]
-		for i, (worker, decision) in enumerate(zip(workers, decisions)):
-			rollout["states"][t, i] = worker["state"]
-			rollout["raw_actions"][t, i] = decision["raw_action"]
-			rollout["old_log_probabilities"][t, i] = decision["log_probability"]
-			rollout["values"][t, i] = decision["value"]
-			if t > 0 and np.isnan(rollout["next_values"][t - 1, i]):
-				rollout["next_values"][t - 1, i] = decision["value"]
+	pending = {}
 
-		futures = [executor.submit(step_worker, worker, decision["action"]) for worker, decision in zip(workers, decisions)]
-		infos, finished = [], []
-		# Consume every future before starting the next batch of calls.
-		results, errors = [], []
-		for future in futures:
-			try:
-				results.append(future.result())
-			except Exception as error:
-				results.append(None)
-				errors.append(error)
-		if errors:
-			raise errors[0]
+	def submit(i, t):
+		worker = workers[i]
+		decision = agent.act(worker["state"])
+		rollout["states"][t, i] = worker["state"]
+		rollout["raw_actions"][t, i] = decision["raw_action"]
+		rollout["old_log_probabilities"][t, i] = decision["log_probability"]
+		rollout["values"][t, i] = decision["value"]
+		if t > 0 and np.isnan(rollout["next_values"][t - 1, i]):
+			rollout["next_values"][t - 1, i] = decision["value"]
+		future = executor.submit(step_worker, worker, decision["action"])
+		pending[future] = (i, t)
 
-		for i, (worker, result) in enumerate(zip(workers, results)):
-			final_state, reward, terminated, truncated, info, following_state = result
+	for i, worker in enumerate(workers):
+		worker["connection"].krpc.paused = False
+		submit(i, 0)
+
+	while pending:
+		ready, _ = wait(pending, return_when=FIRST_COMPLETED)
+		rewards, infos, finished = [], [], []
+		for future in ready:
+			i, t = pending.pop(future)
+			worker = workers[i]
+			final_state, reward, terminated, truncated, info, following_state = future.result()
 			rollout["rewards"][t, i] = reward
 			rollout["terminated"][t, i] = terminated
 			rollout["truncated"][t, i] = truncated
@@ -85,6 +101,7 @@ def collect_rollout(agent, workers, executor, steps, on_step=None):
 			worker["state"] = following_state
 			worker["episode_return"] += reward
 			worker["episode_steps"] += 1
+			rewards.append(reward)
 			infos.append(info)
 			if terminated or truncated:
 				finished.append(
@@ -92,8 +109,18 @@ def collect_rollout(agent, workers, executor, steps, on_step=None):
 				)
 				worker["episode_return"] = 0.0
 				worker["episode_steps"] = 0
+
+			if t + 1 < steps:
+				# Give this worker its next action without waiting for other games.
+				submit(i, t + 1)
+			else:
+				# Its rollout is complete. Hold this game at the update boundary
+				# while other workers finish collecting their own quotas.
+				worker["connection"].krpc.paused = True
+
 		if on_step is not None:
-			on_step(rollout["rewards"][t], infos, finished)
+			on_step(np.asarray(rewards, dtype=np.float32), infos, finished)
+
 	return rollout
 
 
@@ -155,7 +182,7 @@ def train(args, workers):
 	if min(args.updates, args.rollout_steps, args.epochs, args.batch_size) <= 0:
 		raise ValueError("Updates, rollout steps, epochs and batch size must be positive.")
 
-	path = Path(args.checkpoint)
+	path = Path(f"models/{args.checkpoint}")
 	path.parent.mkdir(parents=True, exist_ok=True)
 	checkpoint = torch.load(path, map_location="cpu", weights_only=True) if args.resume else None
 	if checkpoint is not None:
@@ -195,7 +222,7 @@ def train(args, workers):
 				raise ValueError("Workers have different observation layouts.")
 		agent = PPOAgent(observation_size=len(env.last_state), action_size=5, hidden_size=saved.get("hidden_size", 64), device=args.device, learning_rate=args.learning_rate)
 		if checkpoint is not None:
-			expanded = agent.load_training_state(checkpoint, env.observation_names, expand_observations=args.expand_observations)
+			expanded = restore_training_state(agent, checkpoint, env.observation_names, expand_observations=args.expand_observations)
 			if expanded:
 				backup = path.with_name(path.stem + ".before-stage-inputs" + path.suffix)
 				if not backup.exists():
@@ -244,7 +271,7 @@ def train(args, workers):
 
 				def on_step(rewards, infos, finished):
 					nonlocal total_steps, episode_count, successful_episodes
-					total_steps += len(workers)
+					total_steps += len(rewards)
 					finished_episodes.extend(finished)
 					log = {"train/environment_steps": total_steps, "train/elapsed_seconds": time.monotonic() - training_start, "rollout/reward": float(np.mean(rewards))}
 					names = set().union(*(info.get("reward_components", {}) for info in infos))
@@ -266,7 +293,7 @@ def train(args, workers):
 						)
 					if run is not None:
 						run.log(log, step=total_steps + wandb_offset)
-					progress.update(len(workers))
+					progress.update(len(rewards))
 
 				rollout = collect_rollout(agent, workers, executor, args.rollout_steps, on_step)
 				collection_seconds = time.perf_counter() - collection_start

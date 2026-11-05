@@ -35,7 +35,8 @@ def connect_games(workers, args):
 		print(f"Waiting for worker {index}: RPC {rpc_port}, stream {stream_port}")
 
 		while time.monotonic() < deadline:
-			if worker["process"].poll() is not None:
+			process = worker.get("process")
+			if process is not None and process.poll() is not None:
 				raise RuntimeError(f"Worker {index} exited before connecting.")
 
 			remaining = deadline - time.monotonic()
@@ -97,42 +98,42 @@ def position_windows(workers, args):
 
 def launch_games(args, workers):
 	executable = Path(args.ksp).expanduser().resolve()
-	if not executable.is_file():
+	if not args.reuse_games and not executable.is_file():
 		raise FileNotFoundError(f"KSP executable not found: {executable}")
 
 	for index in range(args.instances):
 		started = time.monotonic()
-		rpc_port = args.base_rpc_port + 2 * index
-		stream_port = rpc_port + 1
-		command = [
-			str(executable),
-			"-screen-fullscreen",
-			"0",
-			"-screen-width",
-			str(args.width),
-			"-screen-height",
-			str(args.height),
-			f"--ksp-rl-server=RL-{index}",
-			f"--ksp-rl-rpc-port={rpc_port}",
-			f"--ksp-rl-stream-port={stream_port}",
-		]
-
-		print(f"\nLaunching worker {index}...")
-		process = subprocess.Popen(command, cwd=executable.parent)
-		worker = {"index": index, "process": process}
+		worker = {"index": index, "process": None}
 		workers.append(worker)
 
-		# These existing functions now prepare only this worker.
+		if args.reuse_games:
+			print(f"\nReconnecting to existing worker {index}...")
+		else:
+			rpc_port = args.base_rpc_port + 2 * index
+			stream_port = rpc_port + 1
+			command = [
+				str(executable),
+				"-screen-fullscreen",
+				"0",
+				"-screen-width",
+				str(args.width),
+				"-screen-height",
+				str(args.height),
+				f"--ksp-rl-server=RL-{index}",
+				f"--ksp-rl-rpc-port={rpc_port}",
+				f"--ksp-rl-stream-port={stream_port}",
+			]
+			print(f"\nLaunching worker {index}...")
+			worker["process"] = subprocess.Popen(command, cwd=executable.parent)
+
 		connect_games([worker], args)
 		wait_for_flights([worker], timeout=args.connection_timeout)
-		position_windows([worker], args)
+		if worker["process"] is not None:
+			position_windows([worker], args)
 
-		# Hold prepared games while the remaining games load.
 		worker["connection"].krpc.paused = True
-
 		elapsed = time.monotonic() - started
 		print(f"Worker {index} ready after {elapsed:.1f} seconds.")
-	return workers
 
 
 def wait_for_flights(workers, timeout=120.0):
@@ -143,7 +144,8 @@ def wait_for_flights(workers, timeout=120.0):
 		for worker in pending.copy():
 			connection = worker["connection"]
 
-			if worker["process"].poll() is not None:
+			process = worker.get("process")
+			if process is not None and process.poll() is not None:
 				raise RuntimeError(f"Worker {worker['index']} exited.")
 
 			if connection.krpc.game_scene != connection.krpc.GameScene.flight:
@@ -202,6 +204,7 @@ def main():
 	parser.add_argument("--wandb-name", default=None)
 	parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
 	parser.add_argument("--wandb-run-id", default=None)
+	parser.add_argument("--reuse-games", action="store_true")
 	args = parser.parse_args()
 
 	if min(args.instances, args.width, args.height, args.startup_timeout) <= 0:

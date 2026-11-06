@@ -291,6 +291,13 @@ def train(args, workers):
 								"train/episodes": episode_count,
 							}
 						)
+					for name in ("altitude", "apoapsis", "periapsis"):
+						values = [
+							float(info["telemetry"][name]) for info in infos if not info.get("telemetry_stale", False) and name in info.get("telemetry", {}) and np.isfinite(info["telemetry"][name])
+						]
+
+						if values:
+							log[f"telemetry/{name}"] = float(np.mean(values))
 					if run is not None:
 						run.log(log, step=total_steps + wandb_offset)
 					progress.update(len(rewards))

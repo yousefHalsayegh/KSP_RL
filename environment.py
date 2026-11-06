@@ -16,6 +16,8 @@ class KSPEnvironment:
 		staging_reward_budget=1.0,
 		airtime_weight=10.0,
 		altitude_reward_per_step=0.1,
+		rotation_weight=0.1,
+		angular_speed_scale=1.0,
 	):
 
 		self.client = client
@@ -34,6 +36,8 @@ class KSPEnvironment:
 		self.episode_seconds = episode_seconds
 		self.confirmation_seconds = confirmation_seconds
 		self.airtime_weight = airtime_weight
+		self.rotation_weight = rotation_weight
+		self.angular_speed_scale = angular_speed_scale
 
 		self.episode_start_ut = None
 		self.has_been_airborne = False
@@ -43,7 +47,7 @@ class KSPEnvironment:
 
 		body = client.vessel.orbit.body
 		self.atmosphere_depth = body.atmosphere_depth
-		self.altitude_step_m = self.atmosphere_depth / 20.0
+		self.altitude_step_m = 500
 		self.altitude_reward_per_step = altitude_reward_per_step
 
 		resource_names = {"liquid_fuel": "LiquidFuel", "oxidizer": "Oxidizer", "solid_fuel": "SolidFuel", "monopropellant": "MonoPropellant"}
@@ -179,12 +183,15 @@ class KSPEnvironment:
 		current_band = self.altitude_band(observation["altitude"])
 
 		new_bands = max(0, current_band - self.highest_altitude_band)
-		lost_bands = max(0, self.previous_altitude_band - current_band)
-
-		altitude_reward = (new_bands - lost_bands) * self.altitude_reward_per_step
+		altitude_reward = new_bands * self.altitude_reward_per_step
 
 		self.highest_altitude_band = max(self.highest_altitude_band, current_band)
-		self.previous_altitude_band = current_band
+
+		angular_speed_squared = sum(float(value) ** 2 for value in observation["angular_velocity"])
+
+		rotation_severity = min(angular_speed_squared / self.angular_speed_scale**2, 1.0)
+
+		rotation_penalty = self.rotation_weight * rotation_severity * max(0.0, observation["dt"]) / self.episode_seconds
 
 		self.reward_components = {
 			"orbit_reward": orbit_reward,
@@ -193,6 +200,7 @@ class KSPEnvironment:
 			"staging_reward": staging_reward,
 			"airtime_reward": airtime_reward,
 			"altitude_reward": altitude_reward,
+			"rotation_penalty": rotation_penalty,
 			"outcome_reward": 0.0,
 		}
 
@@ -200,7 +208,7 @@ class KSPEnvironment:
 		if current_progress is not None:
 			self.previous_orbit_progress = current_progress
 
-		return orbit_reward - fuel_penalty - time_penalty + staging_reward + airtime_reward + altitude_reward
+		return orbit_reward - fuel_penalty - time_penalty + staging_reward + airtime_reward + altitude_reward - rotation_penalty
 
 	def check_episode_end(self, observation):
 		situations = self.client.sc.VesselSituation
@@ -397,6 +405,7 @@ class KSPEnvironment:
 			"time_penalty": 0.0,
 			"airtime_reward": 0.0,
 			"altitude_reward": 0,
+			"rotation_penalty": 0.0,
 			"staging_reward": staging_reward,
 			"outcome_reward": outcome_reward,
 		}

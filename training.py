@@ -217,6 +217,7 @@ def train(args, workers):
 			worker["episode_return"], worker["episode_steps"] = 0.0, 0
 
 		env = workers[0]["env"]
+		args.environment = env.reward_configuration()
 		for worker in workers:
 			if worker["env"].observation_names != env.observation_names:
 				raise ValueError("Workers have different observation layouts.")

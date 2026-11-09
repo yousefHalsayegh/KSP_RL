@@ -7,7 +7,8 @@ class KSPEnvironment:
 	# Reserve task inputs now; transfer/landing still need their own environments.
 	TASKS = ("orbit", "transfer", "land")
 	SUPPORTED_TASKS = ("orbit",)
-	OBSERVATION_VERSION = 2
+	OBSERVATION_VERSION = 3
+	PROPELLANTS = {"liquid_fuel": "LiquidFuel", "oxidizer": "Oxidizer", "solid_fuel": "SolidFuel", "monopropellant": "MonoPropellant"}
 
 	def __init__(
 		self,
@@ -19,11 +20,13 @@ class KSPEnvironment:
 		episode_seconds=600.0,
 		confirmation_seconds=5.0,
 		staging_reward_budget=1.0,
-		altitude_reward_per_step=0.1,
+		altitude_reward_per_step=0.02,
 		rotation_weight=0.1,
 		angular_speed_scale=1.0,
-		altitude_step_m=500.0,
+		altitude_step_m=100.0,
 		orbit_altitude=None,
+		staging_cooldown_seconds=2.0,
+		saved_fuel_weight=1.0,
 	):
 
 		self.client = client
@@ -33,6 +36,11 @@ class KSPEnvironment:
 		self.staging_reward_budget = staging_reward_budget
 		self.staging_reward_paid = 0.0
 		self.rewarded_stages = set()
+		self.staging_cooldown_seconds = float(staging_cooldown_seconds)
+		self.saved_fuel_weight = float(saved_fuel_weight)
+		self.last_stage_ut = None
+		self.pending_stages = []
+		self.discarded_propellant_mass = 0.0
 		self.stationary_since = None
 		self.stationary_timeout = 10.0
 		self.stationary_speed = 0.5
@@ -55,24 +63,27 @@ class KSPEnvironment:
 		self.altitude_reward_per_step = altitude_reward_per_step
 		self._requested_orbit_altitude = orbit_altitude
 
-		for name in ("orbit_weight", "fuel_weight", "time_weight", "staging_reward_budget", "altitude_reward_per_step", "rotation_weight", "confirmation_seconds"):
+		for name in ("orbit_weight", "fuel_weight", "time_weight", "staging_reward_budget", "altitude_reward_per_step", "rotation_weight", "confirmation_seconds", "saved_fuel_weight"):
 			value = float(getattr(self, name))
 			if not math.isfinite(value) or value < 0:
 				raise ValueError(f"{name} must be finite and nonnegative.")
 			setattr(self, name, value)
+		if not math.isfinite(self.staging_cooldown_seconds) or not 0 < self.staging_cooldown_seconds <= 3.0:
+			raise ValueError("staging_cooldown_seconds must be positive and at most 3 seconds.")
 		for name in ("episode_seconds", "angular_speed_scale", "altitude_step_m"):
 			value = float(getattr(self, name))
 			if not math.isfinite(value) or value <= 0:
 				raise ValueError(f"{name} must be finite and positive.")
 			setattr(self, name, value)
 
-		resource_names = {"liquid_fuel": "LiquidFuel", "oxidizer": "Oxidizer", "solid_fuel": "SolidFuel", "monopropellant": "MonoPropellant"}
+		resource_names = self.PROPELLANTS
 
 		self.fuel_densities = {field: client.sc.Resources.density(resource) for field, resource in resource_names.items()}
 
 		initial = client.read_observation()
 		self.initialize_observation_scales(initial)
 		self.highest_altitude_band = self.altitude_band(initial["altitude"])
+		self.initial_altitude_band = self.highest_altitude_band
 		self.last_state = self.encode_observation(initial)
 
 		self.initial_propellant_mass = self.propellant_mass(initial)
@@ -99,6 +110,9 @@ class KSPEnvironment:
 			"altitude_step_m": self.altitude_step_m,
 			"altitude_bands": self.max_altitude_band,
 			"maximum_positive_altitude_reward": self.max_altitude_band * self.altitude_reward_per_step,
+			"fuel_penalty_mode": "propellant_discarded_by_staging_only",
+			"staging_reward_mode": "confirmed_ignition_or_empty_separation_with_flight_progress",
+			"empty_tank_fraction_tolerance": 1e-4,
 			**{
 				name: getattr(self, name)
 				for name in (
@@ -108,6 +122,8 @@ class KSPEnvironment:
 					"episode_seconds",
 					"confirmation_seconds",
 					"staging_reward_budget",
+					"staging_cooldown_seconds",
+					"saved_fuel_weight",
 					"altitude_reward_per_step",
 					"rotation_weight",
 					"angular_speed_scale",
@@ -144,6 +160,120 @@ class KSPEnvironment:
 			return self.max_altitude_band
 		return math.floor(max(0.0, altitude) / self.altitude_step_m)
 
+	def staging_cooldown_remaining(self, ut):
+		if self.last_stage_ut is None:
+			return 0.0
+		return min(self.staging_cooldown_seconds, max(0.0, self.staging_cooldown_seconds - (ut - self.last_stage_ut)))
+
+	def _part_propellant(self, part):
+		resources = part.resources
+		names = set(resources.names)
+		mass = capacity = 0.0
+		for field, name in self.PROPELLANTS.items():
+			if name in names:
+				density = self.fuel_densities[field]
+				mass += float(resources.amount(name)) * density
+				capacity += float(resources.max(name)) * density
+		if not all(math.isfinite(value) and value >= 0 for value in (mass, capacity)):
+			raise ValueError("Invalid propellant mass in a stage part.")
+		return mass, capacity
+
+	def _snapshot_stage(self):
+		"""Read parts only for a staging attempt, not on every control step."""
+		for attempt in range(3):
+			try:
+				return self._snapshot_stage_parts()
+			except self.client.conn.krpc.ObjectDestroyedException:
+				if attempt == 2 or not self.client.vessel_exists():
+					raise
+
+	def _snapshot_stage_parts(self):
+		# Remaining mass is sampled before the command; confirmed absent parts
+		# are charged once. Burning between sampling and separation is approximate.
+		next_stage = self.client.control.current_stage - 1
+		if next_stage < 0:
+			return None
+		parts = self.client.vessel.parts.all
+		detaching, igniting = [], []
+		for part in parts:
+			if part.decouple_stage == next_stage:
+				mass, capacity = self._part_propellant(part)
+				engine = part.engine
+				detaching.append({"part": part, "mass": mass, "capacity": capacity, "depleted_engine": engine is not None and not engine.has_fuel})
+			if part.stage == next_stage:
+				engine = part.engine
+				if engine is not None and not engine.active:
+					igniting.append(part)
+		before = self.client.read_observation()
+		return {
+			"stage": next_stage,
+			"detaching": detaching,
+			"igniting": igniting,
+			"altitude": float(before["altitude"]),
+			"orbit_progress": self.orbit_progress(before),
+			"removed": [],
+			"discarded_mass": 0.0,
+		}
+
+	def _evaluate_staging(self, observation):
+		"""Return delayed, once-only staging reward and newly discarded fuel mass."""
+		if not self.pending_stages:
+			return 0.0, 0.0, []
+		parts = self.client.vessel.parts.all
+		ut = float(observation["ut"])
+		progress = self.orbit_progress(observation)
+		altitude_gained = self.altitude_band(observation["altitude"]) > self.initial_altitude_band
+		reward = wasted_mass = 0.0
+		keep, events = [], []
+		for event in self.pending_stages:
+			for item in event["detaching"]:
+				part = item["part"]
+				if part not in parts and part not in event["removed"]:
+					event["removed"].append(part)
+					event["discarded_mass"] += item["mass"]
+					wasted_mass += item["mass"]
+
+			all_removed = bool(event["detaching"]) and len(event["removed"]) == len(event["detaching"])
+			capacity = sum(item["capacity"] for item in event["detaching"])
+			tolerance = max(1e-6, capacity * 1e-4)
+			propulsion_or_tank = capacity > 0 or any(item["depleted_engine"] for item in event["detaching"])
+			empty_separation = all_removed and propulsion_or_tank and event["discarded_mass"] <= tolerance
+			orbit_improved = progress is not None and event["orbit_progress"] is not None and progress > event["orbit_progress"] + 1e-6
+			useful_flight = altitude_gained and (observation["vertical_speed"] > 0 or orbit_improved)
+			climbed_after_ignition = observation["altitude"] >= event["altitude"] + 1.0 and observation["vertical_speed"] > 0
+			ignition = False
+			for part in event["igniting"]:
+				if part in parts:
+					try:
+						engine = part.engine
+						ignition |= engine is not None and engine.active and engine.thrust > 1.0
+					except self.client.conn.krpc.ObjectDestroyedException:
+						# The retained part can disappear after the parts list was read.
+						continue
+			clean_stage = event["discarded_mass"] <= tolerance and (not event["detaching"] or all_removed)
+			within_window = ut <= event["expires_ut"]
+			reason = None
+			if within_window and clean_stage:
+				if empty_separation and useful_flight:
+					reason = "empty_separation_with_altitude_progress"
+				elif ignition and (climbed_after_ignition or orbit_improved):
+					reason = "ignition_with_flight_progress"
+
+			paid = 0.0
+			if reason is not None and event["stage"] not in self.rewarded_stages:
+				remaining = max(0.0, self.staging_reward_budget - self.staging_reward_paid)
+				paid = min(self.staging_reward_budget / self.initial_stage_count, remaining)
+				self.staging_reward_paid += paid
+				self.rewarded_stages.add(event["stage"])
+				reward += paid
+			if reason is not None or not within_window:
+				events.append({"stage": event["stage"], "reason": reason or "not_qualified", "reward": paid, "discarded_propellant_mass": event["discarded_mass"]})
+			else:
+				keep.append(event)
+		self.pending_stages = keep
+		self.discarded_propellant_mass += wasted_mass
+		return reward, wasted_mass, events
+
 	def step(self, action, duration=0.2):
 		"""
 		action: [throttle, pitch, yaw, roll, stage_signal]
@@ -167,19 +297,22 @@ class KSPEnvironment:
 		throttle, pitch, yaw, roll, stage_signal = [max(-1.0, min(1.0, value)) for value in values]
 
 		requested = stage_signal > 0.5
-		activate_stage = requested and not self.stage_requested
+		activate_stage = requested and not self.stage_requested and self.staging_cooldown_remaining(self.client.sc.ut) <= 0.0
 		self.stage_requested = requested
 
 		staging_reward = 0.0
 		activated_stage = None
+		stage_snapshot = None
 		try:
 			if activate_stage:
-				activated_stage = self.client.activate_next_stage()
-				if activated_stage is not None and activated_stage not in self.rewarded_stages:
-					self.rewarded_stages.add(activated_stage)
-					remaining = max(0.0, self.staging_reward_budget - self.staging_reward_paid)
-					staging_reward = min(self.staging_reward_budget / self.initial_stage_count, remaining)
-					self.staging_reward_paid += staging_reward
+				stage_snapshot = self._snapshot_stage()
+				if stage_snapshot is not None:
+					activated_stage = self.client.activate_next_stage()
+					if activated_stage is not None:
+						self.last_stage_ut = self.client.sc.ut
+						stage_snapshot["stage"] = activated_stage
+						stage_snapshot["expires_ut"] = self.last_stage_ut + self.staging_cooldown_seconds
+						self.pending_stages.append(stage_snapshot)
 			observation = self.client.step(throttle=(throttle + 1.0) / 2.0, pitch=pitch, yaw=yaw, roll=roll, duration=duration, manual=True)
 
 		except Exception:
@@ -199,13 +332,25 @@ class KSPEnvironment:
 		if mass <= 0:
 			return self.end_failed_episode("spacecraft_mass_lost", staging_reward)
 
-		reward = self.calculate_reward(observation, staging_reward)
+		try:
+			staging_reward, wasted_mass, staging_events = self._evaluate_staging(observation)
+		except Exception:
+			if self.client.vessel_exists():
+				raise
+			return self.end_failed_episode("spacecraft_destroyed")
+		reward = self.calculate_reward(observation, staging_reward, wasted_mass)
 		terminated, truncated, info = self.check_episode_end(observation)
 		info["task"] = self.task
 
 		terminal_reward = self.outcome_reward(info["end_reason"])
 		reward += terminal_reward
 		self.reward_components["outcome_reward"] = terminal_reward
+		saved_fuel_reward = 0.0
+		if info["success"]:
+			fraction = min(1.0, max(0.0, self.propellant_mass(observation) / self.initial_propellant_mass))
+			saved_fuel_reward = self.saved_fuel_weight * fraction
+			reward += saved_fuel_reward
+		self.reward_components["saved_fuel_reward"] = saved_fuel_reward
 
 		self.episode_finished = terminated or truncated
 
@@ -215,6 +360,8 @@ class KSPEnvironment:
 		info["telemetry"] = observation.copy()
 		info["reward_components"] = self.reward_components.copy()
 		info["stage_activated"] = activated_stage
+		info["staging_events"] = staging_events
+		info["discarded_propellant_mass"] = wasted_mass
 
 		return state, reward, terminated, truncated, info
 
@@ -256,13 +403,13 @@ class KSPEnvironment:
 			self.previous_orbit_progress = current_progress
 		return {"orbit_reward": orbit_reward, "altitude_reward": altitude_reward}
 
-	def calculate_reward(self, observation, staging_reward=0.0):
+	def calculate_reward(self, observation, staging_reward=0.0, wasted_propellant_mass=0.0):
 		dt = float(observation["dt"])
 		if not math.isfinite(dt) or dt < 0:
 			raise ValueError("Received invalid elapsed game time.")
 		task_rewards = self.calculate_task_reward(observation)
-		fuel_used = max(0.0, self.propellant_mass(self.previous_observation) - self.propellant_mass(observation))
-		fuel_penalty = self.fuel_weight * fuel_used / self.initial_propellant_mass
+		# fuel_weight now prices discarded propellant, not ordinary engine burning.
+		fuel_penalty = self.fuel_weight * wasted_propellant_mass / self.initial_propellant_mass
 		time_penalty = self.time_weight * dt / self.episode_seconds
 
 		angular_speed_squared = sum(float(value) ** 2 for value in observation["angular_velocity"])
@@ -273,11 +420,12 @@ class KSPEnvironment:
 
 		self.reward_components = {
 			**task_rewards,
-			"fuel_penalty": fuel_penalty,
+			"wasted_fuel_penalty": fuel_penalty,
 			"time_penalty": time_penalty,
 			"staging_reward": staging_reward,
 			"rotation_penalty": rotation_penalty,
 			"outcome_reward": 0.0,
+			"saved_fuel_reward": 0.0,
 		}
 
 		self.previous_observation = observation.copy()
@@ -359,9 +507,13 @@ class KSPEnvironment:
 		observation = self.client.reset(delay=5.0)
 		self.initialize_observation_scales(observation)
 		self.highest_altitude_band = self.altitude_band(observation["altitude"])
+		self.initial_altitude_band = self.highest_altitude_band
 		self.stage_requested = False
 		self.staging_reward_paid = 0.0
 		self.rewarded_stages = set()
+		self.last_stage_ut = None
+		self.pending_stages = []
+		self.discarded_propellant_mass = 0.0
 		self.episode_start_ut = None
 		self.has_been_airborne = False
 		self.episode_finished = False
@@ -371,8 +523,8 @@ class KSPEnvironment:
 
 		self.initial_propellant_mass = self.propellant_mass(observation)
 
-		if self.initial_propellant_mass <= 0:
-			raise ValueError("The spacecraft has no measured propellant.")
+		if not math.isfinite(self.initial_propellant_mass) or self.initial_propellant_mass <= 0:
+			raise ValueError("The spacecraft has no valid measured propellant.")
 
 		self.previous_observation = observation.copy()
 		self.previous_orbit_progress = self.orbit_progress(observation)
@@ -463,11 +615,13 @@ class KSPEnvironment:
 		features["next_stage_dry_mass_fraction"] = observation["next_stage_dry_mass"] / self.mass_scale
 		features["next_stage_propellant_mass_fraction"] = observation["next_stage_propellant_mass"] / self.mass_scale
 
-		# Append context so the previous 47 feature names/order remain intact.
 		for task in self.TASKS:
 			features[f"task_{task}"] = float(self.task == task)
 		features["orbit_target_altitude_fraction"] = self.orbit_altitude / self.radius_scale
 		features["highest_altitude_band_fraction"] = self.highest_altitude_band / self.max_altitude_band
+		features["staging_cooldown_fraction"] = self.staging_cooldown_remaining(observation["ut"]) / self.staging_cooldown_seconds
+		features["staging_reward_remaining_fraction"] = max(0.0, 1.0 - self.staging_reward_paid / self.staging_reward_budget) if self.staging_reward_budget > 0 else 0.0
+		features["pending_staging_fraction"] = len(self.pending_stages) / self.initial_stage_count
 
 		state = np.asarray(list(features.values()), dtype=np.float32)
 
@@ -485,7 +639,8 @@ class KSPEnvironment:
 
 		self.reward_components = {
 			"orbit_reward": 0.0,
-			"fuel_penalty": 0.0,
+			"wasted_fuel_penalty": 0.0,
+			"saved_fuel_reward": 0.0,
 			"time_penalty": 0.0,
 			"altitude_reward": 0,
 			"rotation_penalty": 0.0,

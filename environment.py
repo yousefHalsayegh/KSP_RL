@@ -27,6 +27,7 @@ class KSPEnvironment:
 		orbit_altitude=None,
 		staging_cooldown_seconds=2.0,
 		saved_fuel_weight=1.0,
+		atmosphere_exit_bonus=5.0,
 	):
 
 		self.client = client
@@ -38,6 +39,8 @@ class KSPEnvironment:
 		self.rewarded_stages = set()
 		self.staging_cooldown_seconds = float(staging_cooldown_seconds)
 		self.saved_fuel_weight = float(saved_fuel_weight)
+		self.atmosphere_exit_bonus = float(atmosphere_exit_bonus)
+		self.atmosphere_exit_achieved = False
 		self.last_stage_ut = None
 		self.pending_stages = []
 		self.discarded_propellant_mass = 0.0
@@ -63,7 +66,17 @@ class KSPEnvironment:
 		self.altitude_reward_per_step = altitude_reward_per_step
 		self._requested_orbit_altitude = orbit_altitude
 
-		for name in ("orbit_weight", "fuel_weight", "time_weight", "staging_reward_budget", "altitude_reward_per_step", "rotation_weight", "confirmation_seconds", "saved_fuel_weight"):
+		for name in (
+			"orbit_weight",
+			"fuel_weight",
+			"time_weight",
+			"staging_reward_budget",
+			"altitude_reward_per_step",
+			"rotation_weight",
+			"confirmation_seconds",
+			"saved_fuel_weight",
+			"atmosphere_exit_bonus",
+		):
 			value = float(getattr(self, name))
 			if not math.isfinite(value) or value < 0:
 				raise ValueError(f"{name} must be finite and nonnegative.")
@@ -106,6 +119,7 @@ class KSPEnvironment:
 		return {
 			"observation_version": self.OBSERVATION_VERSION,
 			"task": self.task,
+			"atmosphere_depth": self.atmosphere_depth,
 			"orbit_altitude": self.orbit_altitude,
 			"altitude_step_m": self.altitude_step_m,
 			"altitude_bands": self.max_altitude_band,
@@ -124,6 +138,7 @@ class KSPEnvironment:
 					"staging_reward_budget",
 					"staging_cooldown_seconds",
 					"saved_fuel_weight",
+					"atmosphere_exit_bonus",
 					"altitude_reward_per_step",
 					"rotation_weight",
 					"angular_speed_scale",
@@ -341,6 +356,7 @@ class KSPEnvironment:
 		reward = self.calculate_reward(observation, staging_reward, wasted_mass)
 		terminated, truncated, info = self.check_episode_end(observation)
 		info["task"] = self.task
+		info["atmosphere_exit_achieved"] = self.atmosphere_exit_achieved
 
 		terminal_reward = self.outcome_reward(info["end_reason"])
 		reward += terminal_reward
@@ -401,7 +417,13 @@ class KSPEnvironment:
 		self.highest_altitude_band = max(self.highest_altitude_band, current_band)
 		if current_progress is not None:
 			self.previous_orbit_progress = current_progress
-		return {"orbit_reward": orbit_reward, "altitude_reward": altitude_reward}
+
+		atmosphere_exit_reward = 0.0
+		if not self.atmosphere_exit_achieved and self.atmosphere_depth > 0.0 and self.previous_observation["altitude"] <= self.atmosphere_depth < observation["altitude"]:
+			self.atmosphere_exit_achieved = True
+			atmosphere_exit_reward = self.atmosphere_exit_bonus
+
+		return {"orbit_reward": orbit_reward, "altitude_reward": altitude_reward, "atmosphere_exit_reward": atmosphere_exit_reward}
 
 	def calculate_reward(self, observation, staging_reward=0.0, wasted_propellant_mass=0.0):
 		dt = float(observation["dt"])
@@ -508,6 +530,7 @@ class KSPEnvironment:
 		self.initialize_observation_scales(observation)
 		self.highest_altitude_band = self.altitude_band(observation["altitude"])
 		self.initial_altitude_band = self.highest_altitude_band
+		self.atmosphere_exit_achieved = False
 		self.stage_requested = False
 		self.staging_reward_paid = 0.0
 		self.rewarded_stages = set()
@@ -615,6 +638,7 @@ class KSPEnvironment:
 		features["next_stage_dry_mass_fraction"] = observation["next_stage_dry_mass"] / self.mass_scale
 		features["next_stage_propellant_mass_fraction"] = observation["next_stage_propellant_mass"] / self.mass_scale
 
+		# Append context so the previous 47 feature names/order remain intact.
 		for task in self.TASKS:
 			features[f"task_{task}"] = float(self.task == task)
 		features["orbit_target_altitude_fraction"] = self.orbit_altitude / self.radius_scale
@@ -643,6 +667,7 @@ class KSPEnvironment:
 			"saved_fuel_reward": 0.0,
 			"time_penalty": 0.0,
 			"altitude_reward": 0,
+			"atmosphere_exit_reward": 0.0,
 			"rotation_penalty": 0.0,
 			"staging_reward": staging_reward,
 			"outcome_reward": outcome_reward,
@@ -652,6 +677,7 @@ class KSPEnvironment:
 			"elapsed": 0.0 if self.episode_start_ut is None else self.client.sc.ut - self.episode_start_ut,
 			"task": self.task,
 			"success": False,
+			"atmosphere_exit_achieved": self.atmosphere_exit_achieved,
 			"end_reason": reason,
 			"telemetry": self.previous_observation.copy(),
 			"reward_components": self.reward_components.copy(),

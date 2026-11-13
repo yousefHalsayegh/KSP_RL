@@ -122,14 +122,16 @@ def launch_games(args, workers):
 				f"--ksp-rl-server=RL-{index}",
 				f"--ksp-rl-rpc-port={rpc_port}",
 				f"--ksp-rl-stream-port={stream_port}",
+				"-batchmode",
+				"-nographics",
 			]
 			print(f"\nLaunching worker {index}...")
 			worker["process"] = subprocess.Popen(command, cwd=executable.parent)
 
 		connect_games([worker], args)
 		wait_for_flights([worker], timeout=args.connection_timeout)
-		if worker["process"] is not None:
-			position_windows([worker], args)
+		# if worker["process"] is not None:
+		# 	position_windows([worker], args)
 
 		worker["connection"].krpc.paused = True
 		elapsed = time.monotonic() - started
@@ -179,8 +181,8 @@ def main():
 	parser = argparse.ArgumentParser(description="Launch KSP training instances.")
 	parser.add_argument("--ksp", required=True, help="Path to KSP_x64.exe")
 	parser.add_argument("--instances", type=int, default=2)
-	parser.add_argument("--width", type=int, default=640)
-	parser.add_argument("--height", type=int, default=480)
+	parser.add_argument("--width", type=int, default=1)
+	parser.add_argument("--height", type=int, default=1)
 	parser.add_argument("--startup-timeout", type=float, default=240.0)
 	parser.add_argument("--base-rpc-port", type=int, default=50000)
 	parser.add_argument("--connection-timeout", type=float, default=900.0)

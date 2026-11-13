@@ -420,11 +420,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\Users\\Yoyo\\documents\\github\\ksp_rl\\ksp-addon\\WorkerServerSelector.csproj",
+      "projectUniqueName": "C:\\Users\\Yoyo\\Documents\\GitHub\\KSP_RL\\ksp-addon\\WorkerServerSelector.csproj",
       "projectName": "WorkerServerSelector",
-      "projectPath": "C:\\Users\\Yoyo\\documents\\github\\ksp_rl\\ksp-addon\\WorkerServerSelector.csproj",
+      "projectPath": "C:\\Users\\Yoyo\\Documents\\GitHub\\KSP_RL\\ksp-addon\\WorkerServerSelector.csproj",
       "packagesPath": "C:\\Users\\Yoyo\\.nuget\\packages\\",
-      "outputPath": "C:\\Users\\Yoyo\\documents\\github\\ksp_rl\\ksp-addon\\obj\\",
+      "outputPath": "C:\\Users\\Yoyo\\Documents\\GitHub\\KSP_RL\\ksp-addon\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
         "C:\\Users\\Yoyo\\AppData\\Roaming\\NuGet\\NuGet.Config"
@@ -465,7 +465,7 @@
             "version": "[1.0.3, )"
           }
         },
-        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.403\\RuntimeIdentifierGraph.json"
+        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.404\\RuntimeIdentifierGraph.json"
       }
     }
   }

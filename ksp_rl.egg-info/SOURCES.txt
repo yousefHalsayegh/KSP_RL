@@ -1,5 +1,6 @@
 agent.py
 client.py
+curriculum.py
 environment.py
 main.py
 pyproject.toml

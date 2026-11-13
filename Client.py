@@ -1,6 +1,11 @@
+import math
+import shutil
 import time
+from pathlib import Path
 
 import krpc  # type: ignore
+
+from curriculum import SaveUnavailable
 
 
 class KSPClient:
@@ -275,3 +280,79 @@ class KSPClient:
 			time.sleep(0.1)
 
 		raise TimeoutError("Launchpad flight did not become ready.")
+
+	def capture_named_save(self, name, destination, *, save_dir, sampled_ut):
+		can_save = getattr(self.sc, "can_save", None)
+		if callable(can_save):
+			can_save = can_save()
+		if can_save is False:
+			raise SaveUnavailable("KSP cannot save the craft in its current state.")
+
+		source = Path(save_dir) / f"{name}.sfs"
+		destination = Path(destination)
+		temporary = destination.with_suffix(".sfs.tmp")
+
+		try:
+			if abs(float(self.sc.ut) - sampled_ut) > 0.25:
+				raise SaveUnavailable("Crossing telemetry is too old to capture.")
+
+			self.sc.save(name)
+
+			if not source.is_file() or source.stat().st_size == 0:
+				raise RuntimeError(f"KSP did not create a usable save at {source}")
+			if abs(float(self.sc.ut) - sampled_ut) > 0.25:
+				raise SaveUnavailable("Game time moved too far during capture.")
+
+			shutil.copyfile(source, temporary)
+			temporary.replace(destination)
+		finally:
+			temporary.unlink(missing_ok=True)
+			source.unlink(missing_ok=True)
+
+	def load_named_save(self, name, *, expected=None, timeout=30.0):
+
+		self._clear_stage_streams()
+		for stream in self.telemetry.values():
+			stream.remove()
+		self.telemetry.clear()
+
+		self.sc.load(name)
+		deadline = time.monotonic() + timeout
+
+		while time.monotonic() < deadline:
+			try:
+				vessel = self.sc.active_vessel
+				if vessel is not None:
+					if expected is None:
+						ready = vessel.situation == self.sc.VesselSituation.pre_launch
+					else:
+						ready = (
+							vessel.name == expected["vessel"]
+							and vessel.orbit.body.name == expected["body"]
+							and vessel.control.current_stage == expected["stage"]
+							and abs(float(self.sc.ut) - expected["ut"]) <= 0.5
+						)
+
+					if ready:
+						break
+			except (RuntimeError, self.conn.krpc.ObjectDestroyedException):
+				# Vessel handles can be temporarily invalid during the scene switch.
+				pass
+
+			time.sleep(0.05)
+		else:
+			raise TimeoutError(f"KSP did not load the expected flight from {name!r}")
+
+		self._bind_vessel()
+		self.manual_control()
+		observation = self.read_observation()
+
+		if expected is not None:
+			if abs(observation["altitude"] - expected["altitude"]) > 50.0:
+				raise RuntimeError(f"{name!r} loaded at an unexpected altitude")
+
+			for resource, amount in expected["fuel"].items():
+				if not math.isclose(observation[resource], amount, rel_tol=0.02, abs_tol=0.5):
+					raise RuntimeError(f"{name!r} loaded with unexpected {resource}")
+
+		return observation

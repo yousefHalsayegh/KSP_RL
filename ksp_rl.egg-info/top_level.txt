@@ -1,5 +1,6 @@
 agent
 client
+curriculum
 environment
 main
 training

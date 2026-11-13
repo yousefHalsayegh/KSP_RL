@@ -104,6 +104,15 @@ def launch_games(args, workers):
 	for index in range(args.instances):
 		started = time.monotonic()
 		worker = {"index": index, "process": None}
+		if args.curriculum_dir is not None:
+			if not args.ksp_save_name:
+				raise ValueError("--ksp-save-name is required with --curriculum-dir")
+
+			worker["save_dir"] = executable.parent / "saves" / args.ksp_save_name
+			pad_save = worker["save_dir"] / "kerbal1_pad.sfs"
+
+			if not pad_save.is_file():
+				raise FileNotFoundError(f"Worker {index} is missing {pad_save}")
 		workers.append(worker)
 
 		if args.reuse_games:
@@ -125,6 +134,11 @@ def launch_games(args, workers):
 				"-batchmode",
 				"-nographics",
 			]
+			if args.curriculum_dir is not None:
+				log_dir = args.curriculum_dir / "ksp_logs"
+				log_dir.mkdir(parents=True, exist_ok=True)
+
+				command += ["-logFile", str(log_dir / f"worker-{index:02d}.log")]
 			print(f"\nLaunching worker {index}...")
 			worker["process"] = subprocess.Popen(command, cwd=executable.parent)
 
@@ -207,12 +221,17 @@ def main():
 	parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
 	parser.add_argument("--wandb-run-id", default=None)
 	parser.add_argument("--reuse-games", action="store_true")
+	parser.add_argument("--curriculum-dir", type=Path, default=None, help="Enable the altitude curriculum and store its flight saves and logs here.")
+	parser.add_argument("--ksp-save-name", help="Folder under KSP/saves containing the current quicksave.sfs.")
 	args = parser.parse_args()
 
 	if min(args.instances, args.width, args.height, args.startup_timeout) <= 0:
 		parser.error("Instance count, dimensions and timeout must be positive.")
 
 	workers = []
+	if args.curriculum_dir is not None:
+		repo_dir = Path(__file__).resolve().parent
+		args.curriculum_dir = (repo_dir / args.curriculum_dir).resolve()
 
 	try:
 		launch_games(args, workers)

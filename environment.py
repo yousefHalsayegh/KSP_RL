@@ -8,7 +8,21 @@ class KSPEnvironment:
 	TASKS = ("orbit", "transfer", "land")
 	SUPPORTED_TASKS = ("orbit",)
 	OBSERVATION_VERSION = 3
+	ASCENT_MILESTONE_FRACTIONS = (0.10, 0.25, 0.50, 0.75)
 	PROPELLANTS = {"liquid_fuel": "LiquidFuel", "oxidizer": "Oxidizer", "solid_fuel": "SolidFuel", "monopropellant": "MonoPropellant"}
+	_CHECKPOINT_FIELDS = (
+		"initial_propellant_mass",
+		"mass_scale",
+		"resource_scales",
+		"initial_stage_count",
+		"initial_altitude_band",
+		"highest_altitude_band",
+		"_ascent_milestones_reached",
+		"atmosphere_exit_achieved",
+		"staging_reward_paid",
+		"discarded_propellant_mass",
+		"stage_requested",
+	)
 
 	def __init__(
 		self,
@@ -28,6 +42,7 @@ class KSPEnvironment:
 		staging_cooldown_seconds=2.0,
 		saved_fuel_weight=1.0,
 		atmosphere_exit_bonus=5.0,
+		ascent_milestone_bonus=1.0,
 	):
 
 		self.client = client
@@ -40,6 +55,7 @@ class KSPEnvironment:
 		self.staging_cooldown_seconds = float(staging_cooldown_seconds)
 		self.saved_fuel_weight = float(saved_fuel_weight)
 		self.atmosphere_exit_bonus = float(atmosphere_exit_bonus)
+		self.ascent_milestone_bonus = float(ascent_milestone_bonus)
 		self.atmosphere_exit_achieved = False
 		self.last_stage_ut = None
 		self.pending_stages = []
@@ -76,6 +92,7 @@ class KSPEnvironment:
 			"confirmation_seconds",
 			"saved_fuel_weight",
 			"atmosphere_exit_bonus",
+			"ascent_milestone_bonus",
 		):
 			value = float(getattr(self, name))
 			if not math.isfinite(value) or value < 0:
@@ -120,6 +137,7 @@ class KSPEnvironment:
 			"observation_version": self.OBSERVATION_VERSION,
 			"task": self.task,
 			"atmosphere_depth": self.atmosphere_depth,
+			"ascent_milestone_altitudes": self.ascent_milestone_altitudes,
 			"orbit_altitude": self.orbit_altitude,
 			"altitude_step_m": self.altitude_step_m,
 			"altitude_bands": self.max_altitude_band,
@@ -139,6 +157,7 @@ class KSPEnvironment:
 					"staging_cooldown_seconds",
 					"saved_fuel_weight",
 					"atmosphere_exit_bonus",
+					"ascent_milestone_bonus",
 					"altitude_reward_per_step",
 					"rotation_weight",
 					"angular_speed_scale",
@@ -151,6 +170,10 @@ class KSPEnvironment:
 	def initialize_observation_scales(self, observation):
 		body = self.client.vessel.orbit.body
 		self.atmosphere_depth = float(body.atmosphere_depth)
+		self.ascent_milestone_altitudes = ()
+		if self.atmosphere_depth > 0.0:
+			self.ascent_milestone_altitudes = tuple(self.atmosphere_depth * fraction for fraction in self.ASCENT_MILESTONE_FRACTIONS)
+		self._ascent_milestones_reached = sum(observation["altitude"] >= altitude for altitude in self.ascent_milestone_altitudes)
 		self.orbit_altitude = self.atmosphere_depth if self._requested_orbit_altitude is None else float(self._requested_orbit_altitude)
 		if not math.isfinite(self.orbit_altitude) or self.orbit_altitude <= 0:
 			raise ValueError("A positive orbit_altitude is required on an airless body.")
@@ -418,12 +441,21 @@ class KSPEnvironment:
 		if current_progress is not None:
 			self.previous_orbit_progress = current_progress
 
+		reached = sum(observation["altitude"] >= altitude for altitude in self.ascent_milestone_altitudes)
+		new_milestones = max(0, reached - self._ascent_milestones_reached)
+		self._ascent_milestones_reached = max(self._ascent_milestones_reached, reached)
+
 		atmosphere_exit_reward = 0.0
 		if not self.atmosphere_exit_achieved and self.atmosphere_depth > 0.0 and self.previous_observation["altitude"] <= self.atmosphere_depth < observation["altitude"]:
 			self.atmosphere_exit_achieved = True
 			atmosphere_exit_reward = self.atmosphere_exit_bonus
 
-		return {"orbit_reward": orbit_reward, "altitude_reward": altitude_reward, "atmosphere_exit_reward": atmosphere_exit_reward}
+		return {
+			"orbit_reward": orbit_reward,
+			"altitude_reward": altitude_reward,
+			"ascent_milestone_reward": new_milestones * self.ascent_milestone_bonus,
+			"atmosphere_exit_reward": atmosphere_exit_reward,
+		}
 
 	def calculate_reward(self, observation, staging_reward=0.0, wasted_propellant_mass=0.0):
 		dt = float(observation["dt"])
@@ -527,6 +559,9 @@ class KSPEnvironment:
 
 	def reset(self):
 		observation = self.client.reset(delay=5.0)
+		return self.reset_from_observation(observation)
+
+	def reset_from_observation(self, observation, metadata=None):
 		self.initialize_observation_scales(observation)
 		self.highest_altitude_band = self.altitude_band(observation["altitude"])
 		self.initial_altitude_band = self.highest_altitude_band
@@ -545,6 +580,19 @@ class KSPEnvironment:
 		self.stationary_since = None
 
 		self.initial_propellant_mass = self.propellant_mass(observation)
+		if metadata is not None:
+			for name in self._CHECKPOINT_FIELDS:
+				setattr(self, name, metadata[name])
+
+			self.resource_scales = dict(metadata["resource_scales"])
+			self.rewarded_stages = set(metadata["rewarded_stages"])
+			ut = float(observation["ut"])
+			self.episode_start_ut = ut - metadata["mission_elapsed"]
+			self.has_been_airborne = True
+
+			remaining = metadata["cooldown_remaining"]
+			if remaining > 0:
+				self.last_stage_ut = ut - (self.staging_cooldown_seconds - remaining)
 
 		if not math.isfinite(self.initial_propellant_mass) or self.initial_propellant_mass <= 0:
 			raise ValueError("The spacecraft has no valid measured propellant.")
@@ -667,6 +715,7 @@ class KSPEnvironment:
 			"saved_fuel_reward": 0.0,
 			"time_penalty": 0.0,
 			"altitude_reward": 0,
+			"ascent_milestone_reward": 0.0,
 			"atmosphere_exit_reward": 0.0,
 			"rotation_penalty": 0.0,
 			"staging_reward": staging_reward,
@@ -699,3 +748,22 @@ class KSPEnvironment:
 			return rewards[reason]
 
 		raise NotImplementedError(f"Outcome rewards are undefined for task: {self.task}")
+
+	def checkpoint_metadata(self):
+		observation = self.previous_observation
+		ut = float(observation["ut"])
+		vessel = self.client.vessel
+		metadata = {name: getattr(self, name) for name in self._CHECKPOINT_FIELDS}
+		metadata["resource_scales"] = dict(self.resource_scales)
+		metadata["rewarded_stages"] = sorted(self.rewarded_stages)
+		metadata["cooldown_remaining"] = self.staging_cooldown_remaining(ut)
+		metadata["mission_elapsed"] = 0.0 if self.episode_start_ut is None else max(0.0, ut - self.episode_start_ut)
+		metadata["expected"] = {
+			"vessel": vessel.name,
+			"body": vessel.orbit.body.name,
+			"ut": ut,
+			"stage": int(observation["stage"]),
+			"altitude": float(observation["altitude"]),
+			"fuel": {resource: float(observation[resource]) for resource in self.PROPELLANTS},
+		}
+		return metadata

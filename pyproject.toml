@@ -20,7 +20,7 @@ dev = ["ruff>=0.9,<1"]
 
 [tool.setuptools]
 packages = []
-py-modules = ["main", "client", "environment", "agent", "training"]
+py-modules = ["main", "client", "environment", "agent", "training", "curriculum"]
 include-package-data = false
 
 [project.scripts]

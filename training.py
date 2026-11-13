@@ -4,6 +4,7 @@ import shutil
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
+from shutil import copyfile
 
 import numpy as np
 import torch
@@ -11,6 +12,7 @@ from tqdm import tqdm
 
 from agent import PPOAgent
 from client import KSPClient
+from curriculum import AltitudeCurriculum
 from environment import KSPEnvironment
 
 
@@ -31,22 +33,91 @@ def restore_training_state(agent, checkpoint, observation_names, expand_observat
 	return False
 
 
+def record_curriculum_step(worker, reward, terminated, truncated, info):
+	curriculum = worker.get("curriculum")
+	if curriculum is None:
+		return
+
+	flight = worker["flight"]
+	env = worker["env"]
+	worker["curriculum_return"] += float(reward)
+	episode_return = worker["curriculum_return"]
+	observation = info.get("telemetry")
+	done = terminated or truncated
+
+	if observation is not None and not info.get("telemetry_stale"):
+		viable = not done and observation["vertical_speed"] > 0 and observation["available_thrust"] > 0 and env.propellant_mass(observation) > 0 and not env.pending_stages
+
+		def capture(name, destination):
+			metadata = env.checkpoint_metadata()
+			worker["client"].capture_named_save(name, destination, save_dir=worker["save_dir"], sampled_ut=metadata["expected"]["ut"])
+			return metadata
+
+		curriculum.observe(flight, altitude=float(observation["altitude"]), viable=viable, episode_return=episode_return, capture=capture)
+
+	if done:
+		info["start_source"] = "checkpoint" if flight.start else "pad"
+		info["start_checkpoint_id"] = flight.start["id"] if flight.start else None
+		curriculum.finish(flight, episode_return=episode_return, reason=info.get("end_reason") or "truncated")
+
+
 def reset_worker(worker):
 	worker["connection"].krpc.paused = False
-	state = worker["env"].reset()
-	worker["client"].manual_control()
+	client = worker["client"]
+	env = worker["env"]
+	curriculum = worker.get("curriculum")
+
+	if curriculum is None:
+		state = env.reset()
+		client.manual_control()
+	else:
+		started = time.perf_counter()
+		flight = curriculum.begin(worker["index"])
+		try:
+			if flight.start is None:
+				observation = client.load_named_save("kerbal1_pad")
+				state = env.reset_from_observation(observation)
+			else:
+				name = flight.start["id"]
+				source = curriculum.directory / f"{name}.sfs"
+				local_save = worker["save_dir"] / f"{name}.sfs"
+
+				if not local_save.is_file():
+					temporary = local_save.with_suffix(".sfs.tmp")
+					try:
+						copyfile(source, temporary)
+						temporary.replace(local_save)
+					finally:
+						temporary.unlink(missing_ok=True)
+
+				metadata = flight.start["metadata"]
+				observation = client.load_named_save(name, expected=metadata["expected"])
+				state = env.reset_from_observation(observation, metadata)
+
+			if not np.all(np.isfinite(state)):
+				raise ValueError("Invalid observation after loading flight")
+
+			curriculum.loaded(flight, float(observation["altitude"]), seconds=time.perf_counter() - started)
+			worker["flight"] = flight
+			worker["curriculum_return"] = 0.0
+		except Exception as error:
+			curriculum.load_failed(flight, error)
+			raise
+
 	if not np.all(np.isfinite(state)):
-		raise ValueError(f"Worker {worker['index']} returned an invalid reset state.")
+		raise ValueError(f"Worker {worker['index']} returned an invalid reset state")
 	return state.copy()
 
 
 def step_worker(worker, action):
 	state, reward, terminated, truncated, info = worker["env"].step(action)
 	if not np.all(np.isfinite(state)) or not np.isfinite(reward):
-		raise ValueError(f"Worker {worker['index']} returned an invalid transition.")
-	# Preserve the final observation separately from the reset observation.
+		raise ValueError(f"Worker {worker['index']} returned an invalid transition")
+
 	final_state = state.copy()
+	record_curriculum_step(worker, reward, terminated, truncated, info)
 	following_state = reset_worker(worker) if terminated or truncated else state.copy()
+
 	return final_state, float(reward), bool(terminated), bool(truncated), info, following_state
 
 
@@ -154,7 +225,7 @@ def prepare_update(agent, workers, rollout, gamma, gae_lambda):
 	}
 
 
-def save_checkpoint(path, agent, env, args, counters, wandb_metadata):
+def save_checkpoint(path, agent, env, args, counters, wandb_metadata, curriculum):
 	numpy_rng = np.random.get_state()
 	payload = {
 		"model": agent.state_dict(),
@@ -166,6 +237,7 @@ def save_checkpoint(path, agent, env, args, counters, wandb_metadata):
 		"wandb": wandb_metadata,
 		"config": vars(args).copy(),
 		"rng": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all() if agent.device.type == "cuda" else [], "numpy": [numpy_rng[0], numpy_rng[1].tolist(), *numpy_rng[2:]]},
+		**({"curriculum": curriculum.state_dict()} if curriculum is not None else {}),
 		**counters,
 	}
 	temporary = path.with_suffix(path.suffix + ".tmp")
@@ -205,8 +277,15 @@ def train(args, workers):
 	elapsed = float(saved.get("elapsed_seconds", 0.0))
 	wandb_metadata = dict(saved.get("wandb") or {})
 	run, completed = None, False
+	curriculum = None
 	try:
+		if args.curriculum_dir is not None:
+			curriculum = AltitudeCurriculum(args.curriculum_dir, pad_workers=(0, 1))
+			if "curriculum" in saved:
+				curriculum.restore(saved["curriculum"])
+
 		for worker in workers:
+			worker["curriculum"] = curriculum
 			client = worker.get("client")
 			if client is None:
 				client = KSPClient(connection=worker["connection"])
@@ -331,6 +410,7 @@ def train(args, workers):
 							"worker_count": len(workers),
 						},
 						wandb_metadata,
+						curriculum,
 					)
 					if run is not None:
 						run.log(
@@ -369,3 +449,5 @@ def train(args, workers):
 					tqdm.write(f"Worker {worker['index']} cleanup failed: {error}")
 		if run is not None:
 			run.finish(exit_code=0 if completed else 1)
+		if curriculum is not None:
+			curriculum.close()

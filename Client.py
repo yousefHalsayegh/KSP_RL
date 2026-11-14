@@ -286,7 +286,7 @@ class KSPClient:
 		if callable(can_save):
 			can_save = can_save()
 		if can_save is False:
-			raise SaveUnavailable("KSP cannot save the craft in its current state.")
+			print(f"[capture test] can_save=False; trying named save {name!r} (throttle={self.control.throttle:.2f}, thrust={self.vessel.thrust:.0f} N)", flush=True)
 
 		source = Path(save_dir) / f"{name}.sfs"
 		destination = Path(destination)

@@ -3,7 +3,7 @@
 import shutil
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from pathlib import Path
+from pathlib import Path, WindowsPath
 from shutil import copyfile
 
 import numpy as np
@@ -235,7 +235,7 @@ def save_checkpoint(path, agent, env, args, counters, wandb_metadata, curriculum
 		"action_size": agent.log_std.numel(),
 		"hidden_size": agent.actor[0].out_features,
 		"wandb": wandb_metadata,
-		"config": vars(args).copy(),
+		"config": {name: str(value) if isinstance(value, Path) else value for name, value in vars(args).items()},
 		"rng": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all() if agent.device.type == "cuda" else [], "numpy": [numpy_rng[0], numpy_rng[1].tolist(), *numpy_rng[2:]]},
 		**({"curriculum": curriculum.state_dict()} if curriculum is not None else {}),
 		**counters,
@@ -256,7 +256,10 @@ def train(args, workers):
 
 	path = Path(f"models/{args.checkpoint}")
 	path.parent.mkdir(parents=True, exist_ok=True)
-	checkpoint = torch.load(path, map_location="cpu", weights_only=True) if args.resume else None
+	checkpoint = None
+	if args.resume:
+		with torch.serialization.safe_globals([WindowsPath]):
+			checkpoint = torch.load(path, map_location="cpu", weights_only=True)
 	if checkpoint is not None:
 		for name in ("model", "optimizer", "observation_size", "completed_updates", "total_steps"):
 			if name not in checkpoint:
@@ -280,7 +283,7 @@ def train(args, workers):
 	curriculum = None
 	try:
 		if args.curriculum_dir is not None:
-			curriculum = AltitudeCurriculum(args.curriculum_dir, pad_workers=(0, 1))
+			curriculum = AltitudeCurriculum(args.curriculum_dir, pad_workers=(0, 1), window=50)
 			if "curriculum" in saved:
 				curriculum.restore(saved["curriculum"])
 
@@ -423,6 +426,7 @@ def train(args, workers):
 								"rollout/reward_mean": float(rollout["rewards"].mean()),
 								"rollout/episodes_finished": len(finished_episodes),
 								**{f"ppo/{name}": value for name, value in metrics.items() if value is not None},
+								**(curriculum.wandb_metrics() if curriculum is not None else {}),
 							},
 							step=total_steps + wandb_offset + 1,
 						)

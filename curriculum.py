@@ -1,12 +1,17 @@
+"""Thread-safe altitude curriculum for a shared PPO policy."""
+
 import copy
+import hashlib
 import json
 import logging
 import math
+import shutil
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import RLock
 from uuid import uuid4
 
@@ -48,7 +53,9 @@ class AltitudeCurriculum:
 		self._phase = "advance"
 		self._active = None
 		self._promoted = {}
+		self._slots = {}
 		self._candidates = {}
+		self._metric_counts = {}
 		self._recent = deque(maxlen=window)
 		self._attempts = 0
 
@@ -57,6 +64,13 @@ class AltitudeCurriculum:
 		self._handler.close()
 
 	def _log(self, event, **fields):
+		with self._lock:
+			self._metric_counts[event] = self._metric_counts.get(event, 0) + 1
+			if event == "capture_completed" and fields.get("targets_m"):
+				key = "candidate_saved"
+				self._metric_counts[key] = self._metric_counts.get(key, 0) + 1
+			if event == "phase_changed" and fields.get("reason") == "fallback":
+				self._metric_counts["fallback"] = self._metric_counts.get("fallback", 0) + 1
 		self._logger.info(json.dumps({"time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"), "event": event, **fields}, allow_nan=False))
 
 	@property
@@ -115,52 +129,85 @@ class AltitudeCurriculum:
 			raise ValueError("Candidate return must be finite.")
 		crossed = [target for target in self.targets if previous < target <= altitude and target not in flight.reached]
 		flight.reached.update(crossed)
-		flight.pending_capture.update(crossed)
-		flight.pending_capture = {target for target in flight.pending_captures if target <= altitude <= target + 250.0}
-		now = time.monotonic()
-		if not flight.pending_captures or now < flight.next_capture_at:
+		flight.pending_captures.update(crossed)
+		flight.pending_captures = {target for target in flight.pending_captures if target <= altitude <= target + 250.0}
+		if not flight.pending_captures or time.monotonic() < flight.next_capture_at:
 			return
 
 		with self._lock:
-			if flight.generaton != self._generation or self._phase != "advance":
+			if flight.generation != self._generation or self._phase != "advance":
 				return
-			candidates = [target for target in sorted(flight.pending_captures) if target > self.active_altitude and score > self._candidates.get(target, {}).get("score", -math.inf)]
-		if candidates:
-			if self._capture(flight, candidates, altitude, score, capture):
-				flight.pending_captures.difference_update(candidates)
+			targets = [target for target in sorted(flight.pending_captures) if target > self.active_altitude and self._improves_slot(flight, target, score)]
+		if targets:
+			if self._capture(flight, targets, altitude, score, capture):
+				flight.pending_captures.difference_update(targets)
 			else:
 				flight.next_capture_at = time.monotonic() + 1.0
 
-	def _capture(self, flight, targets, altitude, score, capture):
-		# One snapshot serves every threshold crossed in this action.
-		save_id = f"rl_{max(targets):05d}m_w{flight.worker}_{uuid4().hex}"
-		path = self.directory / (save_id + ".sfs")
-		try:
-			metadata = dict(capture(save_id, path))
-			metadata["prefix_return"] = score
-			json.dumps(metadata, allow_nan=False)
-			if not path.is_file() or not path.stat().st_size:
-				raise RuntimeError(f"Capture did not produce a complete save: {path}")
-		except SaveUnavailable as error:
-			path.unlink(missing_ok=True)
-			self._flight_log("capture_unavailable", flight, targets_m=targets, error=str(error))
-			return False
-		except Exception as error:
-			path.unlink(missing_ok=True)
-			self._flight_log("capture_failed", flight, targets_m=targets, error=str(error))
-			raise
+	def _improves_slot(self, flight, target, score):
+		existing = self._slots.get((flight.worker, target))
+		return existing is None or score > existing["score"]
 
-		with self._lock:
-			accepted = []
-			if flight.generation == self._generation:
-				for target in targets:
-					if score > self._candidates.get(target, {}).get("score", -math.inf):
-						self._candidates[target] = dict(id=save_id, target_m=target, saved_altitude_m=altitude, parent=self._active, score=score, metadata=metadata)
-						accepted.append(target)
-			if not accepted:
-				path.unlink()
-			self._flight_log("capture_completed", flight, save_id=save_id, targets_m=accepted, altitude_m=altitude, prefix_return=score)
+	@staticmethod
+	def _digest(path):
+		digest = hashlib.sha256()
+		with path.open("rb") as source:
+			for chunk in iter(lambda: source.read(1024 * 1024), b""):
+				digest.update(chunk)
+		return digest.hexdigest()
+
+	def _capture(self, flight, targets, altitude, score, capture):
+		# Keep the worker's previous save until the new capture is complete.
+		name = f"rl_capture_w{flight.worker}_{uuid4().hex}"
+		with TemporaryDirectory(prefix="capture-", dir=self.directory) as work:
+			scratch = Path(work) / (name + ".sfs")
+			try:
+				metadata = dict(capture(name, scratch))
+				metadata["prefix_return"] = score
+				json.dumps(metadata, allow_nan=False)
+				if not scratch.is_file() or not scratch.stat().st_size:
+					raise RuntimeError(f"Capture did not produce a complete save: {scratch}")
+				digest = self._digest(scratch)
+				with self._lock:
+					accepted = []
+					save_ids = []
+					if flight.generation == self._generation:
+						for target in targets:
+							if not self._improves_slot(flight, target, score):
+								continue
+							slot_id = f"rl_candidate_w{flight.worker:02d}_{target:05d}m"
+							slot_path = self.directory / (slot_id + ".sfs")
+							replacement = Path(work) / (slot_id + ".sfs")
+							shutil.copyfile(scratch, replacement)
+							replacement.replace(slot_path)
+							entry = dict(id=slot_id, worker=flight.worker, target_m=target, saved_altitude_m=altitude, parent=self._active, score=score, metadata=metadata, digest=digest)
+							self._slots[(flight.worker, target)] = entry
+							best = self._candidates.get(target)
+							if best is None or score > best["score"]:
+								self._candidates[target] = entry
+							accepted.append(target)
+							save_ids.append(slot_id)
+					self._flight_log("capture_completed", flight, save_id=save_ids[-1] if save_ids else None, save_ids=save_ids, targets_m=accepted, altitude_m=altitude, prefix_return=score)
+			except SaveUnavailable as error:
+				self._flight_log("capture_unavailable", flight, targets_m=targets, error=str(error))
+				return False
+			except Exception as error:
+				self._flight_log("capture_failed", flight, targets_m=targets, error=str(error))
+				raise
 		return True
+
+	def _freeze_candidate(self, candidate):
+		"""Publish an immutable save before making it a training start."""
+		source = self.directory / (candidate["id"] + ".sfs")
+		save_id = f"rl_promoted_{candidate['target_m']:05d}m_{uuid4().hex}"
+		destination = self.directory / (save_id + ".sfs")
+		temporary = destination.with_suffix(".sfs.tmp")
+		try:
+			shutil.copyfile(source, temporary)
+			temporary.replace(destination)
+		finally:
+			temporary.unlink(missing_ok=True)
+		return {**candidate, "id": save_id}
 
 	def finish(self, flight, *, episode_return, reason):
 		"""Count one completed attempt. A stale flight contributes only to logs."""
@@ -194,7 +241,7 @@ class AltitudeCurriculum:
 			qualified = [target for target, rate in rates.items() if rate >= self.config["promote"]]
 			available = [target for target in qualified if target in self._candidates]
 			if available:
-				chosen = self._candidates[max(available)]
+				chosen = self._freeze_candidate(self._candidates[max(available)])
 				self._promoted[chosen["id"]] = chosen
 				self._log("promotion", from_m=active, to_m=chosen["target_m"], save_id=chosen["id"], reach_rate=rates[chosen["target_m"]], attempts=len(self._recent), prefix_return=chosen["score"])
 				self._change_phase("advance", chosen["id"], "promotion")
@@ -209,6 +256,7 @@ class AltitudeCurriculum:
 		self._generation += 1
 		self._recent.clear()
 		self._candidates.clear()
+		self._slots.clear()
 		self._attempts = 0
 		self._log(
 			"phase_changed",
@@ -218,6 +266,45 @@ class AltitudeCurriculum:
 			generation=self._generation,
 			highest_promoted_m=max((entry["target_m"] for entry in self._promoted.values()), default=0),
 		)
+
+	def wandb_metrics(self):
+		with self._lock:
+			active = self.active_altitude
+			probing = self._phase == "probe"
+			start = active
+			if probing:
+				target = active
+				parent = self._promoted[self._active]["parent"]
+				start = self._promoted[parent]["target_m"] if parent else 0
+			else:
+				target = next((height for height in self.targets if height > active), None)
+
+			size = len(self._recent)
+			metrics = {
+				"curriculum/active_tier": active // self.config["step_m"],
+				"curriculum/active_altitude_m": active,
+				"curriculum/curriculum_workers_start_m": start,
+				"curriculum/highest_promoted_m": max((entry["target_m"] for entry in self._promoted.values()), default=0),
+				"curriculum/generation": self._generation,
+				"curriculum/probe_active": int(probing),
+				"curriculum/window_size": size,
+				"curriculum/phase_attempts": self._attempts,
+				"curriculum/candidate_tiers": len(self._candidates),
+				"curriculum/candidate_slots": len(self._slots),
+			}
+			if target is not None:
+				hits = sum(target in reached for reached in self._recent)
+				metrics["curriculum/target_m"] = target
+				metrics["curriculum/target_hits"] = hits
+				metrics["curriculum/target_has_save"] = int(target in self._candidates)
+				if size:
+					metrics["curriculum/target_reach_rate"] = hits / size
+
+			capture_events = ("capture_unavailable", "capture_failed", "capture_completed")
+			for event in (*capture_events, "candidate_saved", "promotion", "fallback", "load_failed"):
+				metrics[f"curriculum/{event}_total"] = self._metric_counts.get(event, 0)
+			metrics["curriculum/capture_attempts_total"] = sum(self._metric_counts.get(event, 0) for event in capture_events)
+			return metrics
 
 	def state_dict(self):
 		"""Embed this in the same atomic .pt as the policy and optimizer."""
@@ -230,18 +317,24 @@ class AltitudeCurriculum:
 					phase=self._phase,
 					active=self._active,
 					promoted=self._promoted,
-					candidates=list(self._candidates.values()),
+					candidates=list(self._slots.values()),
+					metric_counts=self._metric_counts,
 					recent=list(self._recent),
 					attempts=self._attempts,
 				)
 			)
 
 	def restore(self, state):
-		if state["version"] != 1 or state["config"] != self.config:
-			raise ValueError("Saved curriculum version or settings do not match.")
+		if state["version"] != 1:
+			raise ValueError("Saved curriculum version does not match.")
+		saved_config = state["config"]
+		changed = set(saved_config) | set(self.config)
+		incompatible = sorted(key for key in changed if key != "window" and saved_config.get(key) != self.config.get(key))
+		if incompatible:
+			raise ValueError("Saved curriculum settings do not match: " + ", ".join(incompatible))
 		with self._lock:
 			state = copy.deepcopy(state)
-			entries = list(state["promoted"].values()) + state["candidates"]
+			entries = state["promoted"].values()
 			for entry in entries:
 				path = self.directory / (entry["id"] + ".sfs")
 				if not path.is_file() or not path.stat().st_size:
@@ -250,8 +343,29 @@ class AltitudeCurriculum:
 			self._phase = state["phase"]
 			self._active = state["active"]
 			self._promoted = state["promoted"]
-			self._candidates = {entry["target_m"]: entry for entry in state["candidates"]}
+			self._metric_counts = dict(state.get("metric_counts", {}))
+			self._slots.clear()
+			self._candidates.clear()
+			for entry in state["candidates"]:
+				candidate_path = self.directory / (entry["id"] + ".sfs")
+				if not candidate_path.is_file() or not candidate_path.stat().st_size or ("digest" in entry and self._digest(candidate_path) != entry["digest"]):
+					# A capture may have overwritten this slot after the last PPO save.
+					self._log("candidate_skipped_on_restore", save_id=entry["id"])
+					continue
+				target = entry["target_m"]
+				self._slots[(entry.get("worker", -1), target)] = entry
+				best = self._candidates.get(target)
+				if best is None or entry["score"] > best["score"]:
+					self._candidates[target] = entry
 			self._recent.clear()
 			self._recent.extend(state["recent"])
 			self._attempts = state["attempts"]
-			self._log("restored", phase=self._phase, active_m=self.active_altitude, generation=self._generation, window_size=len(self._recent))
+			self._log(
+				"restored",
+				phase=self._phase,
+				active_m=self.active_altitude,
+				generation=self._generation,
+				window_size=len(self._recent),
+				saved_window=saved_config["window"],
+				configured_window=self.config["window"],
+			)

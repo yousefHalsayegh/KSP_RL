@@ -36,7 +36,7 @@ class Flight:
 
 
 class AltitudeCurriculum:
-	def __init__(self, directory, *, pad_workers=(0, 1), step_m=1000, ceiling_m=70000, window=100, promote=0.80, demote=0.60, probe_after=200):
+	def __init__(self, directory, *, pad_workers=(0, 1), step_m=1000, ceiling_m=70000, window=10, promote=0.80, demote=0.60, probe_after=200):
 		if step_m <= 0 or ceiling_m < step_m or ceiling_m % step_m:
 			raise ValueError("The ceiling must be a positive multiple of step_m.")
 		if not 0 < demote < promote <= 1 or window <= 0 or probe_after < window:

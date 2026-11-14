@@ -16,6 +16,47 @@ from curriculum import AltitudeCurriculum
 from environment import KSPEnvironment
 
 
+def bind_worker_client(worker, *, recover_to_pad, timeout=45.0):
+	connection = worker["connection"]
+	sc = connection.space_center
+	connection.krpc.paused = False
+
+	deadline = time.monotonic() + timeout
+	pad_requested = False
+	last_error = None
+
+	while time.monotonic() < deadline:
+		try:
+			# After requesting the pad, wait for that flight before binding.
+			if pad_requested:
+				vessel = sc.active_vessel
+				if vessel is None or vessel.situation != sc.VesselSituation.pre_launch:
+					time.sleep(0.1)
+					continue
+
+			client = KSPClient(connection=connection)
+
+		except connection.krpc.ObjectDestroyedException as exc:
+			last_error = exc
+		except RuntimeError as exc:
+			if not any(message in str(exc) for message in ("The vessel has no parts.", "No active vessel yet.")):
+				raise
+			last_error = exc
+		else:
+			if pad_requested:
+				tqdm.write(f"Worker {worker['index']}: rebound on the launchpad.")
+			return client
+
+		if recover_to_pad and not pad_requested:
+			tqdm.write(f"Worker {worker['index']}: loading kerbal1_pad on the existing connection.")
+			sc.load("kerbal1_pad")
+			pad_requested = True
+
+		time.sleep(0.1)
+
+	raise TimeoutError(f"Worker {worker['index']}: could not bind a usable vessel (pad load requested={pad_requested}).") from last_error
+
+
 def restore_training_state(agent, checkpoint, observation_names, expand_observations=False):
 	loader = getattr(agent, "load_training_state", None)
 	if loader is not None:
@@ -283,7 +324,7 @@ def train(args, workers):
 	curriculum = None
 	try:
 		if args.curriculum_dir is not None:
-			curriculum = AltitudeCurriculum(args.curriculum_dir, pad_workers=(0, 1), window=50)
+			curriculum = AltitudeCurriculum(args.curriculum_dir, pad_workers=(0, 1), window=10)
 			if "curriculum" in saved:
 				curriculum.restore(saved["curriculum"])
 
@@ -443,14 +484,9 @@ def train(args, workers):
 	finally:
 		for worker in workers:
 			client = worker.get("client")
-			if client is not None:
-				try:
-					worker["connection"].krpc.paused = False
-					client.stop_controls()
-					if client.sc.can_revert_to_launch():
-						client.reset()
-				except Exception as error:
-					tqdm.write(f"Worker {worker['index']} cleanup failed: {error}")
+			if client is None:
+				client = bind_worker_client(worker, recover_to_pad=args.curriculum_dir is not None)
+				worker["client"] = client
 		if run is not None:
 			run.finish(exit_code=0 if completed else 1)
 		if curriculum is not None:

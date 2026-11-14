@@ -8,71 +8,123 @@ import krpc  # type: ignore
 from curriculum import SaveUnavailable
 
 
+class CheckpointMismatch(RuntimeError):
+	"""The live vessel disagrees with the recorded checkpoint."""
+
+
 class KSPClient:
-	def __init__(self, name="KSP Client", connection=None):
+	PROPELLANT_NAMES = {"liquid_fuel": "LiquidFuel", "oxidizer": "Oxidizer", "solid_fuel": "SolidFuel", "monopropellant": "MonoPropellant"}
+
+	def __init__(self, name="KSP Client", connection=None, *, recovery_save="kerbal1_pad"):
 		self.conn = connection if connection is not None else krpc.connect(name=name)
 		self.sc = self.conn.space_center
 		self.telemetry = {}
 
-		self._bind_vessel()
+		try:
+			self._bind_vessel()
+		except (RuntimeError, self.conn.krpc.ObjectDestroyedException) as error:
+			if not self._vessel_unavailable(error):
+				raise
+			previous_pause = self.conn.krpc.paused
+			try:
+				self.conn.krpc.paused = False
+				if recovery_save is not None:
+					print(f"[ksp] Recovering the active vessel from {recovery_save!r}", flush=True)
+					self.sc.load(recovery_save)
+				self._wait_and_bind(require_pad=recovery_save is not None, deadline=time.monotonic() + 45.0, label=recovery_save or "active flight")
+			finally:
+				self.conn.krpc.paused = previous_pause
 
-	def _bind_vessel(self):
-		self._clear_stage_streams()
-		self.vessel = self.sc.active_vessel
-		self.control = self.vessel.control
-		self.ap = self.vessel.auto_pilot
+	def _vessel_unavailable(self, error):
+		return isinstance(error, self.conn.krpc.ObjectDestroyedException) or "The vessel has no parts" in str(error) or "No active vessel yet." in str(error)
 
-		self.surface_frame = self.vessel.surface_reference_frame
-		self.flight = self.vessel.flight(self.vessel.orbit.body.reference_frame)
-		self.root_part = self.vessel.parts.root
-		self._initialize_telemetry()
+	def _bind_vessel(self, vessel=None):
+		if vessel is None:
+			vessel = self.sc.active_vessel
+		if vessel is None:
+			raise RuntimeError("No active vessel yet.")
+
+		root = vessel.parts.root
+		if root is None:
+			raise RuntimeError("The vessel has no parts.")
+
+		self._clear_telemetry()
+		self.vessel = vessel
+		self.root_part = root
+		try:
+			self.control = vessel.control
+			self.ap = vessel.auto_pilot
+			self.surface_frame = vessel.surface_reference_frame
+			self.flight = vessel.flight(vessel.orbit.body.reference_frame)
+			self._initialize_telemetry()
+		except Exception:
+			self._clear_telemetry()
+			raise
+
+	def _wait_and_bind(self, *, require_pad, deadline, label):
+		last_error = None
+		while time.monotonic() < deadline:
+			try:
+				vessel = self.sc.active_vessel
+				if vessel is not None and (not require_pad or vessel.situation == self.sc.VesselSituation.pre_launch):
+					self._bind_vessel(vessel)
+					return
+			except (RuntimeError, self.conn.krpc.ObjectDestroyedException) as error:
+				if not self._vessel_unavailable(error):
+					raise
+				last_error = error
+			time.sleep(0.05)
+		raise TimeoutError(f"KSP did not expose a usable vessel for {label!r}") from last_error
 
 	def _initialize_telemetry(self):
 		self.attitude = self.vessel.flight(self.surface_frame)
 
-		def stream_property(obj, name):
+		def stream_property(field, obj, name):
 			stream = self.conn.add_stream(getattr, obj, name)
+			self.telemetry[field] = stream
 			stream.rate = 10
-			return stream
 
-		self.telemetry = {
-			"ut": stream_property(self.sc, "ut"),
-			"altitude": stream_property(self.flight, "mean_altitude"),
-			"surface_altitude": stream_property(self.flight, "surface_altitude"),
-			"vertical_speed": stream_property(self.flight, "vertical_speed"),
-			"horizontal_speed": stream_property(self.flight, "horizontal_speed"),
-			"surface_speed": stream_property(self.flight, "speed"),
-			"dynamic_pressure": stream_property(self.flight, "dynamic_pressure"),
-			"pitch": stream_property(self.attitude, "pitch"),
-			"heading": stream_property(self.attitude, "heading"),
-			"roll": stream_property(self.attitude, "roll"),
-			"mass": stream_property(self.vessel, "mass"),
-			"thrust": stream_property(self.vessel, "thrust"),
-			"available_thrust": stream_property(self.vessel, "available_thrust"),
-			"throttle": stream_property(self.control, "throttle"),
-			"pitch_input": stream_property(self.control, "pitch"),
-			"yaw_input": stream_property(self.control, "yaw"),
-			"roll_input": stream_property(self.control, "roll"),
-			"sas": stream_property(self.control, "sas"),
-			"situation": stream_property(self.vessel, "situation"),
-			"apoapsis": stream_property(self.vessel.orbit, "apoapsis_altitude"),
-			"periapsis": stream_property(self.vessel.orbit, "periapsis_altitude"),
-			"time_to_apoapsis": stream_property(self.vessel.orbit, "time_to_apoapsis"),
-			"eccentricity": stream_property(self.vessel.orbit, "eccentricity"),
-			"inclination": stream_property(self.vessel.orbit, "inclination"),
-			"orbital_speed": stream_property(self.vessel.orbit, "speed"),
+		properties = {
+			"ut": (self.sc, "ut"),
+			"altitude": (self.flight, "mean_altitude"),
+			"surface_altitude": (self.flight, "surface_altitude"),
+			"vertical_speed": (self.flight, "vertical_speed"),
+			"horizontal_speed": (self.flight, "horizontal_speed"),
+			"surface_speed": (self.flight, "speed"),
+			"dynamic_pressure": (self.flight, "dynamic_pressure"),
+			"pitch": (self.attitude, "pitch"),
+			"heading": (self.attitude, "heading"),
+			"roll": (self.attitude, "roll"),
+			"mass": (self.vessel, "mass"),
+			"thrust": (self.vessel, "thrust"),
+			"available_thrust": (self.vessel, "available_thrust"),
+			"throttle": (self.control, "throttle"),
+			"pitch_input": (self.control, "pitch"),
+			"yaw_input": (self.control, "yaw"),
+			"roll_input": (self.control, "roll"),
+			"sas": (self.control, "sas"),
+			"situation": (self.vessel, "situation"),
+			"apoapsis": (self.vessel.orbit, "apoapsis_altitude"),
+			"periapsis": (self.vessel.orbit, "periapsis_altitude"),
+			"time_to_apoapsis": (self.vessel.orbit, "time_to_apoapsis"),
+			"eccentricity": (self.vessel.orbit, "eccentricity"),
+			"inclination": (self.vessel.orbit, "inclination"),
+			"orbital_speed": (self.vessel.orbit, "speed"),
 		}
+
+		for field, (obj, name) in properties.items():
+			stream_property(field, obj, name)
 
 		for field, resource in {"liquid_fuel": "LiquidFuel", "oxidizer": "Oxidizer", "solid_fuel": "SolidFuel", "electric_charge": "ElectricCharge", "monopropellant": "MonoPropellant"}.items():
 			stream = self.conn.add_stream(self.vessel.resources.amount, resource)
-			stream.rate = 10
 			self.telemetry[field] = stream
+			stream.rate = 10
 
 		frame = self.vessel.orbit.body.non_rotating_reference_frame
 		for name, method in {"position": self.vessel.position, "velocity": self.vessel.velocity, "rotation": self.vessel.rotation, "angular_velocity": self.vessel.angular_velocity}.items():
 			stream = self.conn.add_stream(method, frame)
-			stream.rate = 10
 			self.telemetry[name] = stream
+			stream.rate = 10
 
 	def vessel_exists(self):
 		for vessel in self.sc.vessels:
@@ -244,115 +296,153 @@ class KSPClient:
 		else:
 			print("Revert to launch is unavailable.")
 
+	def _clear_telemetry(self):
+		self._clear_stage_streams()
+		for stream in self.telemetry.values():
+			try:
+				stream.remove()
+			except (self.conn.krpc.ObjectDestroyedException, self.conn.krpc.StreamRemovedException):
+				pass
+		self.telemetry.clear()
+
 	def close(self):
 		try:
-			self._clear_stage_streams()
+			self._clear_telemetry()
 		finally:
 			self.conn.close()
 
 	def reset(self, delay=5.0, timeout=30.0):
 		self.stop_controls()
-
 		if not self.sc.can_revert_to_launch():
 			raise RuntimeError("Revert to launch is unavailable.")
 
-		self._clear_stage_streams()
-		for stream in self.telemetry.values():
-			stream.remove()
-
-		self.telemetry.clear()
-
+		self._clear_telemetry()
 		self.revert_to_launch(delay=delay)
+		self._wait_and_bind(require_pad=True, deadline=time.monotonic() + timeout, label="launchpad")
+		return self.read_observation()
 
-		deadline = time.monotonic() + timeout
-
-		while time.monotonic() < deadline:
-			try:
-				vessel = self.sc.active_vessel
-				ready = vessel is not None and vessel.situation == self.sc.VesselSituation.pre_launch
-			except Exception:  # noqa: BLE001
-				ready = False
-
-			if ready:
-				self._bind_vessel()
-				return self.read_observation()
-
-			time.sleep(0.1)
-
-		raise TimeoutError("Launchpad flight did not become ready.")
-
-	def capture_named_save(self, name, destination, *, save_dir, sampled_ut):
-		can_save = getattr(self.sc, "can_save", None)
-		if callable(can_save):
-			can_save = can_save()
-		if can_save is False:
-			print(f"[capture test] can_save=False; trying named save {name!r} (throttle={self.control.throttle:.2f}, thrust={self.vessel.thrust:.0f} N)", flush=True)
-
+	def capture_named_save(self, name, destination, *, save_dir, sampled_ut, expected=None):
 		source = Path(save_dir) / f"{name}.sfs"
 		destination = Path(destination)
 		temporary = destination.with_suffix(".sfs.tmp")
+		if source.exists():
+			raise FileExistsError(f"Capture requires a unique KSP save name: {source}")
 
+		krpc_service = self.conn.krpc
+		previous_pause = krpc_service.paused
 		try:
-			if abs(float(self.sc.ut) - sampled_ut) > 0.25:
-				raise SaveUnavailable("Crossing telemetry is too old to capture.")
+			try:
+				krpc_service.paused = True
+				if not krpc_service.paused:
+					raise SaveUnavailable("KSP did not pause for capture.")
+				frozen_ut = float(self.sc.ut)
+				if abs(frozen_ut - sampled_ut) > 0.25:
+					raise SaveUnavailable("Crossing telemetry is too old at pause.")
+				if expected is not None:
+					try:
+						self._verify_checkpoint(name, expected, altitude_tolerance=10.0)
+					except CheckpointMismatch as error:
+						raise SaveUnavailable(str(error)) from error
 
-			self.sc.save(name)
+				self.sc.save(name)
+				if not krpc_service.paused or abs(float(self.sc.ut) - frozen_ut) > 1e-6:
+					raise SaveUnavailable("Game time advanced during the paused save.")
+			finally:
+				krpc_service.paused = previous_pause
 
 			if not source.is_file() or source.stat().st_size == 0:
 				raise RuntimeError(f"KSP did not create a usable save at {source}")
-			if abs(float(self.sc.ut) - sampled_ut) > 0.25:
-				raise SaveUnavailable("Game time moved too far during capture.")
-
 			shutil.copyfile(source, temporary)
 			temporary.replace(destination)
 		finally:
 			temporary.unlink(missing_ok=True)
 			source.unlink(missing_ok=True)
 
+	def _verify_checkpoint(self, name, expected, *, altitude_tolerance):
+		ut = float(self.sc.ut)
+		altitude = float(self.flight.mean_altitude)
+		vessel = self.vessel
+		identity = (vessel.name, vessel.orbit.body.name, self.control.current_stage)
+		if identity != (expected["vessel"], expected["body"], expected["stage"]):
+			raise CheckpointMismatch(f"{name!r} vessel, body or stage mismatch: {identity!r}")
+		if not math.isfinite(altitude) or abs(altitude - expected["altitude"]) > altitude_tolerance:
+			raise CheckpointMismatch(f"{name!r} altitude mismatch: expected={expected['altitude']:.2f} m, actual={altitude:.2f} m, UT delta={ut - expected['ut']:+.3f} s")
+
+		resources = vessel.resources
+		fuel = {}
+		for field, amount in expected["fuel"].items():
+			actual = float(resources.amount(self.PROPELLANT_NAMES[field]))
+			if not math.isclose(actual, amount, rel_tol=0.02, abs_tol=0.5):
+				raise CheckpointMismatch(f"{name!r} fuel mismatch for {field}: expected={amount:.2f}, actual={actual:.2f}")
+			fuel[field] = actual
+		return {"ut": ut, "altitude": altitude, **fuel}
+
 	def load_named_save(self, name, *, expected=None, timeout=30.0):
+		self._clear_telemetry()
+		krpc_service = self.conn.krpc
+		previous_pause = krpc_service.paused
+		try:
+			krpc_service.paused = False
+			self.sc.load(name)
+			deadline = time.monotonic() + timeout
+			if expected is None:
+				self._wait_and_bind(require_pad=True, deadline=deadline, label=name)
+				self.manual_control()
+				return self.read_observation()
 
-		self._clear_stage_streams()
-		for stream in self.telemetry.values():
-			stream.remove()
-		self.telemetry.clear()
+			checked = self._bind_loaded_checkpoint(name, expected, deadline)
+			self.manual_control()
+			observation = self.read_observation()
+			observation.update(checked)
+			return observation
+		finally:
+			krpc_service.paused = previous_pause
 
-		self.sc.load(name)
-		deadline = time.monotonic() + timeout
+	def _bind_loaded_checkpoint(self, name, expected, deadline):
+		sc = self.sc
+		krpc_service = self.conn.krpc
+		vessel_name = expected["vessel"]
+		body_name = expected["body"]
+		stage = int(expected["stage"])
+		expected_ut = float(expected["ut"])
+		min_ut = expected_ut - 0.25
+		max_ut = expected_ut + 0.50
 
+		def pause_at_checkpoint():
+			ut = sc.ut
+			if ut < min_ut or ut > max_ut:
+				return False, ut
+			vessel = sc.active_vessel
+			if vessel is None:
+				return False, ut
+			if vessel.name != vessel_name or vessel.orbit.body.name != body_name:
+				return False, ut
+			if vessel.control.current_stage != stage:
+				return False, ut
+			root = vessel.parts.root
+			if root is None:
+				return False, ut
+			krpc_service.paused = True
+			return True, ut
+
+		closest_ut = None
+		last_error = None
 		while time.monotonic() < deadline:
 			try:
-				vessel = self.sc.active_vessel
-				if vessel is not None:
-					if expected is None:
-						ready = vessel.situation == self.sc.VesselSituation.pre_launch
-					else:
-						ready = (
-							vessel.name == expected["vessel"]
-							and vessel.orbit.body.name == expected["body"]
-							and vessel.control.current_stage == expected["stage"]
-							and abs(float(self.sc.ut) - expected["ut"]) <= 0.5
-						)
+				ready, ut = self.conn.run(pause_at_checkpoint)
+				if closest_ut is None or abs(ut - expected_ut) < abs(closest_ut - expected_ut):
+					closest_ut = ut
+				if ready:
+					if not krpc_service.paused:
+						raise CheckpointMismatch(f"{name!r} did not pause on reload.")
+					self._bind_vessel()
+					return self._verify_checkpoint(name, expected, altitude_tolerance=50.0)
+			except (RuntimeError, self.conn.krpc.ObjectDestroyedException) as error:
+				if not self._vessel_unavailable(error):
+					raise
+				last_error = error
+				if krpc_service.paused:
+					krpc_service.paused = False
+			time.sleep(0.02)
 
-					if ready:
-						break
-			except (RuntimeError, self.conn.krpc.ObjectDestroyedException):
-				# Vessel handles can be temporarily invalid during the scene switch.
-				pass
-
-			time.sleep(0.05)
-		else:
-			raise TimeoutError(f"KSP did not load the expected flight from {name!r}")
-
-		self._bind_vessel()
-		self.manual_control()
-		observation = self.read_observation()
-
-		if expected is not None:
-			if abs(observation["altitude"] - expected["altitude"]) > 50.0:
-				raise RuntimeError(f"{name!r} loaded at an unexpected altitude")
-
-			for resource, amount in expected["fuel"].items():
-				if not math.isclose(observation[resource], amount, rel_tol=0.02, abs_tol=0.5):
-					raise RuntimeError(f"{name!r} loaded with unexpected {resource}")
-
-		return observation
+		raise TimeoutError(f"KSP did not load {name!r} within the checkpoint window: expected UT={expected_ut:.3f}, closest sampled UT={closest_ut!r}") from last_error

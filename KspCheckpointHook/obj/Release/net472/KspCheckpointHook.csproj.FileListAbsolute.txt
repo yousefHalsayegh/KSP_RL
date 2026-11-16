@@ -1,0 +1,10 @@
+C:\Users\Yoyo\documents\github\ksp_rl\KspCheckpointHook\bin\Release\net472\KspCheckpointHook.dll
+C:\Users\Yoyo\documents\github\ksp_rl\KspCheckpointHook\bin\Release\net472\KspCheckpointHook.pdb
+C:\Users\Yoyo\documents\github\ksp_rl\KspCheckpointHook\obj\Release\net472\KspCheckpointHook.csproj.AssemblyReference.cache
+C:\Users\Yoyo\documents\github\ksp_rl\KspCheckpointHook\obj\Release\net472\KspCheckpointHook.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Yoyo\documents\github\ksp_rl\KspCheckpointHook\obj\Release\net472\KspCheckpointHook.AssemblyInfoInputs.cache
+C:\Users\Yoyo\documents\github\ksp_rl\KspCheckpointHook\obj\Release\net472\KspCheckpointHook.AssemblyInfo.cs
+C:\Users\Yoyo\documents\github\ksp_rl\KspCheckpointHook\obj\Release\net472\KspCheckpointHook.csproj.CoreCompileInputs.cache
+C:\Users\Yoyo\documents\github\ksp_rl\KspCheckpointHook\obj\Release\net472\KspCheckpointHook.sourcelink.json
+C:\Users\Yoyo\documents\github\ksp_rl\KspCheckpointHook\obj\Release\net472\KspCheckpointHook.dll
+C:\Users\Yoyo\documents\github\ksp_rl\KspCheckpointHook\obj\Release\net472\KspCheckpointHook.pdb

@@ -11,50 +11,9 @@ import torch
 from tqdm import tqdm
 
 from agent import PPOAgent
-from client import KSPClient
+from client import CheckpointMismatch, KSPClient
 from curriculum import AltitudeCurriculum
 from environment import KSPEnvironment
-
-
-def bind_worker_client(worker, *, recover_to_pad, timeout=45.0):
-	connection = worker["connection"]
-	sc = connection.space_center
-	connection.krpc.paused = False
-
-	deadline = time.monotonic() + timeout
-	pad_requested = False
-	last_error = None
-
-	while time.monotonic() < deadline:
-		try:
-			# After requesting the pad, wait for that flight before binding.
-			if pad_requested:
-				vessel = sc.active_vessel
-				if vessel is None or vessel.situation != sc.VesselSituation.pre_launch:
-					time.sleep(0.1)
-					continue
-
-			client = KSPClient(connection=connection)
-
-		except connection.krpc.ObjectDestroyedException as exc:
-			last_error = exc
-		except RuntimeError as exc:
-			if not any(message in str(exc) for message in ("The vessel has no parts.", "No active vessel yet.")):
-				raise
-			last_error = exc
-		else:
-			if pad_requested:
-				tqdm.write(f"Worker {worker['index']}: rebound on the launchpad.")
-			return client
-
-		if recover_to_pad and not pad_requested:
-			tqdm.write(f"Worker {worker['index']}: loading kerbal1_pad on the existing connection.")
-			sc.load("kerbal1_pad")
-			pad_requested = True
-
-		time.sleep(0.1)
-
-	raise TimeoutError(f"Worker {worker['index']}: could not bind a usable vessel (pad load requested={pad_requested}).") from last_error
 
 
 def restore_training_state(agent, checkpoint, observation_names, expand_observations=False):
@@ -91,7 +50,9 @@ def record_curriculum_step(worker, reward, terminated, truncated, info):
 
 		def capture(name, destination):
 			metadata = env.checkpoint_metadata()
-			worker["client"].capture_named_save(name, destination, save_dir=worker["save_dir"], sampled_ut=metadata["expected"]["ut"])
+			expected = metadata["expected"]
+			expected["velocity"] = [float(value) for value in observation["velocity"]]
+			worker["client"].capture_named_save(name, destination, save_dir=worker["save_dir"], sampled_ut=expected["ut"], expected=expected)
 			return metadata
 
 		curriculum.observe(flight, altitude=float(observation["altitude"]), viable=viable, episode_return=episode_return, capture=capture)
@@ -103,47 +64,65 @@ def record_curriculum_step(worker, reward, terminated, truncated, info):
 
 
 def reset_worker(worker):
-	worker["connection"].krpc.paused = False
 	client = worker["client"]
 	env = worker["env"]
 	curriculum = worker.get("curriculum")
 
 	if curriculum is None:
+		client.resume_collection()
 		state = env.reset()
 		client.manual_control()
 	else:
-		started = time.perf_counter()
-		flight = curriculum.begin(worker["index"])
-		try:
-			if flight.start is None:
-				observation = client.load_named_save("kerbal1_pad")
-				state = env.reset_from_observation(observation)
-			else:
-				name = flight.start["id"]
-				source = curriculum.directory / f"{name}.sfs"
-				local_save = worker["save_dir"] / f"{name}.sfs"
+		while True:
+			started = time.perf_counter()
+			flight = curriculum.begin(worker["index"])
 
-				if not local_save.is_file():
-					temporary = local_save.with_suffix(".sfs.tmp")
-					try:
-						copyfile(source, temporary)
-						temporary.replace(local_save)
-					finally:
-						temporary.unlink(missing_ok=True)
+			try:
+				if flight.start is None:
+					observation = client.load_named_save("kerbal1_pad")
+					state = env.reset_from_observation(observation)
+				else:
+					name = flight.start["id"]
+					source = curriculum.directory / f"{name}.sfs"
+					local_save = worker["save_dir"] / f"{name}.sfs"
 
-				metadata = flight.start["metadata"]
-				observation = client.load_named_save(name, expected=metadata["expected"])
-				state = env.reset_from_observation(observation, metadata)
+					if not source.is_file():
+						raise CheckpointMismatch(f"Checkpoint was removed: {source}")
 
-			if not np.all(np.isfinite(state)):
-				raise ValueError("Invalid observation after loading flight")
+					if not local_save.is_file():
+						temporary = local_save.with_suffix(".sfs.tmp")
+						try:
+							copyfile(source, temporary)
+							temporary.replace(local_save)
+						except FileNotFoundError as error:
+							if not source.is_file():
+								raise CheckpointMismatch(f"Checkpoint was removed during copy: {source}") from error
+							raise
+						finally:
+							temporary.unlink(missing_ok=True)
 
-			curriculum.loaded(flight, float(observation["altitude"]), seconds=time.perf_counter() - started)
-			worker["flight"] = flight
-			worker["curriculum_return"] = 0.0
-		except Exception as error:
-			curriculum.load_failed(flight, error)
-			raise
+					metadata = flight.start["metadata"]
+					observation = client.load_named_save(name, expected=metadata["expected"], save_path=local_save)
+					state = env.reset_from_observation(observation, metadata)
+
+				if not np.all(np.isfinite(state)):
+					raise ValueError("Invalid observation after loading flight")
+
+				curriculum.loaded(flight, float(observation["altitude"]), seconds=time.perf_counter() - started)
+				worker["flight"] = flight
+				worker["curriculum_return"] = 0.0
+				break
+
+			except CheckpointMismatch as error:
+				curriculum.load_failed(flight, error)
+				if flight.start is None:
+					raise
+				tqdm.write(f"Worker {worker['index']}: discarded {flight.start['id']}; selecting a new start. {error}")
+				continue
+
+			except Exception as error:
+				curriculum.load_failed(flight, error)
+				raise
 
 	if not np.all(np.isfinite(state)):
 		raise ValueError(f"Worker {worker['index']} returned an invalid reset state")
@@ -192,7 +171,7 @@ def collect_rollout(agent, workers, executor, steps, on_step=None):
 		pending[future] = (i, t)
 
 	for i, worker in enumerate(workers):
-		worker["connection"].krpc.paused = False
+		worker["client"].resume_collection()
 		submit(i, 0)
 
 	while pending:
@@ -324,6 +303,9 @@ def train(args, workers):
 	curriculum = None
 	try:
 		if args.curriculum_dir is not None:
+			for worker in workers:
+				if not hasattr(worker["connection"], "checkpoint_control"):
+					raise RuntimeError(f"Worker {worker['index']} has no CheckpointControl service. Install the checkpoint hook DLL and restart KSP.")
 			curriculum = AltitudeCurriculum(args.curriculum_dir, pad_workers=(0, 1), window=10)
 			if "curriculum" in saved:
 				curriculum.restore(saved["curriculum"])
@@ -332,9 +314,8 @@ def train(args, workers):
 			worker["curriculum"] = curriculum
 			client = worker.get("client")
 			if client is None:
-				client = KSPClient(connection=worker["connection"])
+				client = KSPClient(connection=worker["connection"], recovery_save="kerbal1_pad" if curriculum is not None else None)
 				worker["client"] = client
-			worker["connection"].krpc.paused = False
 			worker["env"] = KSPEnvironment(client, task="orbit", episode_seconds=args.episode_seconds)
 			worker["state"] = reset_worker(worker)
 			worker["episode_return"], worker["episode_steps"] = 0.0, 0
@@ -475,19 +456,20 @@ def train(args, workers):
 						wandb_offset += 1
 					tqdm.write(f"Update {update_index + 1}: samples={samples_per_update} | collection={collection_seconds:.1f}s | update={update_seconds:.2f}s")
 				finally:
-					for worker in workers:
-						worker["connection"].krpc.paused = False
 					progress.set_description("Collecting")
 		completed = True
 	except KeyboardInterrupt:
 		tqdm.write("Interrupted; the latest completed-update checkpoint is preserved.")
 	finally:
 		for worker in workers:
-			client = worker.get("client")
-			if client is None:
-				client = bind_worker_client(worker, recover_to_pad=args.curriculum_dir is not None)
-				worker["client"] = client
-		if run is not None:
-			run.finish(exit_code=0 if completed else 1)
-		if curriculum is not None:
-			curriculum.close()
+			if worker.get("client") is not None:
+				try:
+					worker["connection"].krpc.paused = True
+				except Exception as error:
+					tqdm.write(f"Worker {worker['index']} could not pause during cleanup: {error}")
+		try:
+			if run is not None:
+				run.finish(exit_code=0 if completed else 1)
+		finally:
+			if curriculum is not None:
+				curriculum.close()

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <KspManaged>$(KspDir)/KSP_x64_Data/Managed</KspManaged>
+    <KrpcDir Condition="'$(KrpcDir)' == ''">$(KspDir)/GameData/kRPC</KrpcDir>
+  </PropertyGroup>
+  <Target Name="CheckKspReferences" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="!Exists('$(KspManaged)/Assembly-CSharp.dll')"
+           Text="Set -p:KspDir=... to your KSP installation (Assembly-CSharp.dll missing)." />
+    <Error Condition="!Exists('$(KrpcDir)/KRPC.Core.dll')"
+           Text="KRPC.Core.dll missing. Set -p:KrpcDir=... to your kRPC DLL folder." />
+  </Target>
+  <ItemGroup>
+    <Reference Include="Assembly-CSharp" HintPath="$(KspManaged)/Assembly-CSharp.dll" Private="false" />
+    <Reference Include="UnityEngine" HintPath="$(KspManaged)/UnityEngine.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(KspManaged)/UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="KRPC.Core" HintPath="$(KrpcDir)/KRPC.Core.dll" Private="false" />
+  </ItemGroup>
+</Project>

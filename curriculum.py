@@ -36,7 +36,7 @@ class Flight:
 
 
 class AltitudeCurriculum:
-	def __init__(self, directory, *, pad_workers=(0, 1), step_m=1000, ceiling_m=70000, window=10, promote=0.80, demote=0.60, probe_after=200):
+	def __init__(self, directory, *, pad_workers=(0, 1), step_m=1000, ceiling_m=70000, window=100, promote=0.80, demote=0.60, probe_after=200):
 		if step_m <= 0 or ceiling_m < step_m or ceiling_m % step_m:
 			raise ValueError("The ceiling must be a positive multiple of step_m.")
 		if not 0 < demote < promote <= 1 or window <= 0 or probe_after < window:
@@ -85,7 +85,7 @@ class AltitudeCurriculum:
 			if worker in self.config["pad_workers"]:
 				save_id = None
 			elif self._phase == "probe":
-				save_id = self._promoted[self._active]["parent"]
+				save_id = self._usable_start(self._promoted[self._active]["parent"])
 			start = copy.deepcopy(self._promoted[save_id]) if save_id else None
 			flight = Flight(worker, self._generation, self._phase, start)
 			self._flight_log("load_requested", flight)
@@ -110,6 +110,33 @@ class AltitudeCurriculum:
 
 	def load_failed(self, flight, error):
 		self._flight_log("load_failed", flight, error=str(error))
+
+	def _usable_start(self, save_id):
+		while save_id is not None:
+			if (self.directory / (save_id + ".sfs")).is_file():
+				return save_id
+			save_id = self._promoted[save_id]["parent"]
+		return None
+
+	def discard_checkpoint(self, flight, error):
+		"""Delete the invalid save while retaining its parent link for older resumes."""
+		if flight.start is None:
+			raise ValueError("Cannot discard the launchpad baseline.")
+		with self._lock:
+			save_id = flight.start["id"]
+			path = self.directory / (save_id + ".sfs")
+			try:
+				path.unlink()
+			except FileNotFoundError:
+				pass
+			else:
+				self._flight_log("checkpoint_discarded", flight, error=str(error))
+
+			active = self._usable_start(self._active)
+			if active != self._active:
+				self._change_phase("advance", active, "checkpoint_discarded")
+			elif self._phase == "probe" and flight.generation == self._generation:
+				self._change_phase("probe", active, "probe_checkpoint_discarded")
 
 	def observe(self, flight, *, altitude, viable, episode_return, capture):
 		"""Record first viable upward crossings and capture improved candidate saves.
@@ -217,7 +244,7 @@ class AltitudeCurriculum:
 			flight.finished = True
 			eligible = flight.generation == self._generation
 			if eligible and self._phase == "probe":
-				parent = self._promoted[self._active]["parent"]
+				parent = self._usable_start(self._promoted[self._active]["parent"])
 				source = flight.start["id"] if flight.start else None
 				eligible = source == parent
 			self._flight_log("episode_finished", flight, eligible=eligible, reached_m=sorted(flight.reached), reason=reason, episode_return=float(episode_return))
@@ -232,7 +259,7 @@ class AltitudeCurriculum:
 			if self._phase == "probe":
 				hits = sum(active in crossed for crossed in self._recent)
 				passed = hits / len(self._recent) >= self.config["demote"]
-				parent = self._promoted[self._active]["parent"]
+				parent = self._usable_start(self._promoted[self._active]["parent"])
 				self._log("probe_completed", target_m=active, successes=hits, attempts=len(self._recent), fallback=not passed)
 				self._change_phase("advance", self._active if passed else parent, "probe_passed" if passed else "fallback")
 				return
@@ -274,7 +301,7 @@ class AltitudeCurriculum:
 			start = active
 			if probing:
 				target = active
-				parent = self._promoted[self._active]["parent"]
+				parent = self._usable_start(self._promoted[self._active]["parent"])
 				start = self._promoted[parent]["target_m"] if parent else 0
 			else:
 				target = next((height for height in self.targets if height > active), None)
@@ -301,7 +328,7 @@ class AltitudeCurriculum:
 					metrics["curriculum/target_reach_rate"] = hits / size
 
 			capture_events = ("capture_unavailable", "capture_failed", "capture_completed")
-			for event in (*capture_events, "candidate_saved", "promotion", "fallback", "load_failed"):
+			for event in (*capture_events, "candidate_saved", "promotion", "fallback", "load_failed", "checkpoint_discarded"):
 				metrics[f"curriculum/{event}_total"] = self._metric_counts.get(event, 0)
 			metrics["curriculum/capture_attempts_total"] = sum(self._metric_counts.get(event, 0) for event in capture_events)
 			return metrics
@@ -334,11 +361,6 @@ class AltitudeCurriculum:
 			raise ValueError("Saved curriculum settings do not match: " + ", ".join(incompatible))
 		with self._lock:
 			state = copy.deepcopy(state)
-			entries = state["promoted"].values()
-			for entry in entries:
-				path = self.directory / (entry["id"] + ".sfs")
-				if not path.is_file() or not path.stat().st_size:
-					raise FileNotFoundError(f"Curriculum save missing or empty: {path}")
 			self._generation = state["generation"]
 			self._phase = state["phase"]
 			self._active = state["active"]
@@ -360,6 +382,13 @@ class AltitudeCurriculum:
 			self._recent.clear()
 			self._recent.extend(state["recent"])
 			self._attempts = state["attempts"]
+			active = self._usable_start(self._active)
+			if active != self._active:
+				self._change_phase("advance", active, "checkpoint_discarded_on_restore")
+			elif self._phase == "probe":
+				parent = self._promoted[active]["parent"]
+				if self._usable_start(parent) != parent:
+					self._change_phase("probe", active, "probe_checkpoint_discarded_on_restore")
 			self._log(
 				"restored",
 				phase=self._phase,

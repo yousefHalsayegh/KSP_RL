@@ -104,6 +104,8 @@ def launch_games(args, workers):
 	for index in range(args.instances):
 		started = time.monotonic()
 		worker = {"index": index, "process": None}
+		pad_save = None
+
 		if args.curriculum_dir is not None:
 			if not args.ksp_save_name:
 				raise ValueError("--ksp-save-name is required with --curriculum-dir")
@@ -113,6 +115,7 @@ def launch_games(args, workers):
 
 			if not pad_save.is_file():
 				raise FileNotFoundError(f"Worker {index} is missing {pad_save}")
+
 		workers.append(worker)
 
 		if args.reuse_games:
@@ -131,23 +134,40 @@ def launch_games(args, workers):
 				f"--ksp-rl-server=RL-{index}",
 				f"--ksp-rl-rpc-port={rpc_port}",
 				f"--ksp-rl-stream-port={stream_port}",
-				"-batchmode",
-				"-nographics",
 			]
+			if args.headless:
+				command += ["-batchmode", "-nographics"]
 			if args.curriculum_dir is not None:
 				log_dir = args.curriculum_dir / "ksp_logs"
 				log_dir.mkdir(parents=True, exist_ok=True)
-
 				command += ["-logFile", str(log_dir / f"worker-{index:02d}.log")]
+
 			print(f"\nLaunching worker {index}...")
 			worker["process"] = subprocess.Popen(command, cwd=executable.parent)
 
 		connect_games([worker], args)
-		wait_for_flights([worker], timeout=args.connection_timeout)
-		# if worker["process"] is not None:
-		# 	position_windows([worker], args)
 
-		worker["connection"].krpc.paused = True
+		# NEW: recover a worker that connected while still at the Space Center.
+		connection = worker["connection"]
+		rpc = connection.krpc
+
+		if rpc.game_scene == rpc.GameScene.space_center:
+			print(f"Worker {index}: at Space Center; resuming saved flight.", flush=True)
+			try:
+				rpc.game_scene = rpc.GameScene.flight
+			except RuntimeError as error:
+				if pad_save is None:
+					raise RuntimeError(f"Worker {index}: could not resume flight from Space Center.") from error
+
+				print(f"Worker {index}: flight resume failed; loading {pad_save.name}. kRPC reported: {error}", flush=True)
+				connection.space_center.load(pad_save.stem)
+
+		wait_for_flights([worker], timeout=args.connection_timeout)
+
+		if not args.headless and worker["process"] is not None:
+			position_windows([worker], args)
+
+		rpc.paused = True
 		elapsed = time.monotonic() - started
 		print(f"Worker {index} ready after {elapsed:.1f} seconds.")
 
@@ -215,6 +235,7 @@ def main():
 	parser.add_argument("--resume", action="store_true")
 	parser.add_argument("--expand-observations", action="store_true")
 	parser.add_argument("--wandb", action="store_true")
+	parser.add_argument("--headless", action="store_true")
 	parser.add_argument("--wandb-project", default="ksp-rl")
 	parser.add_argument("--wandb-entity", default=None)
 	parser.add_argument("--wandb-name", default=None)

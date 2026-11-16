@@ -2,6 +2,7 @@ import math
 import shutil
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import krpc  # type: ignore
 
@@ -19,6 +20,7 @@ class KSPClient:
 		self.conn = connection if connection is not None else krpc.connect(name=name)
 		self.sc = self.conn.space_center
 		self.telemetry = {}
+		self._checkpoint_pause = None
 
 		try:
 			self._bind_vessel()
@@ -264,6 +266,11 @@ class KSPClient:
 		else:
 			self.apply_action(throttle, pitch)
 
+		# The loaded controls are replaced before KSP can advance again.
+		if self._checkpoint_pause is not None:
+			self.conn.checkpoint_control.release(self._checkpoint_pause)
+			self._checkpoint_pause = None
+
 		while self.sc.ut - start_ut < duration:
 			if time.monotonic() >= deadline:
 				raise TimeoutError("Game time stopped advancing.")
@@ -321,6 +328,33 @@ class KSPClient:
 		self._wait_and_bind(require_pad=True, deadline=time.monotonic() + timeout, label="launchpad")
 		return self.read_observation()
 
+	def resume_collection(self):
+		"""Release a PPO update pause while preserving a pending first-action pause."""
+		if self._checkpoint_pause is None:
+			self.conn.krpc.paused = False
+
+	@staticmethod
+	def _saved_flight_ut(path):
+		in_flight_state = False
+		with Path(path).open(encoding="utf-8-sig") as save:
+			for line in save:
+				line = line.strip()
+				if line == "FLIGHTSTATE":
+					in_flight_state = True
+				elif in_flight_state and line in ("VESSEL", "}"):
+					break
+				elif in_flight_state:
+					key, separator, value = line.partition("=")
+					if separator and key.strip() == "UT":
+						try:
+							ut = float(value)
+						except ValueError:
+							break
+						if math.isfinite(ut):
+							return ut
+						break
+		raise CheckpointMismatch(f"{str(path)!r} has no valid FLIGHTSTATE UT.")
+
 	def capture_named_save(self, name, destination, *, save_dir, sampled_ut, expected=None):
 		source = Path(save_dir) / f"{name}.sfs"
 		destination = Path(destination)
@@ -345,13 +379,19 @@ class KSPClient:
 						raise SaveUnavailable(str(error)) from error
 
 				self.sc.save(name)
-				if not krpc_service.paused or abs(float(self.sc.ut) - frozen_ut) > 1e-6:
+				if not krpc_service.paused:
 					raise SaveUnavailable("Game time advanced during the paused save.")
 			finally:
 				krpc_service.paused = previous_pause
 
 			if not source.is_file() or source.stat().st_size == 0:
 				raise RuntimeError(f"KSP did not create a usable save at {source}")
+			try:
+				saved_ut = self._saved_flight_ut(source)
+			except CheckpointMismatch as error:
+				raise SaveUnavailable(str(error)) from error
+			if abs(saved_ut - frozen_ut) > 0.04:
+				raise SaveUnavailable(f"Written save UT={saved_ut:.3f} s differs from paused UT={frozen_ut:.3f} s.")
 			shutil.copyfile(source, temporary)
 			temporary.replace(destination)
 		finally:
@@ -375,74 +415,77 @@ class KSPClient:
 			if not math.isclose(actual, amount, rel_tol=0.02, abs_tol=0.5):
 				raise CheckpointMismatch(f"{name!r} fuel mismatch for {field}: expected={amount:.2f}, actual={actual:.2f}")
 			fuel[field] = actual
-		return {"ut": ut, "altitude": altitude, **fuel}
+		checked = {"ut": ut, "altitude": altitude, **fuel}
+		if "velocity" in expected:
+			frame = vessel.orbit.body.non_rotating_reference_frame
+			velocity = tuple(float(component) for component in vessel.velocity(frame))
+			error = math.sqrt(sum((actual - saved) ** 2 for actual, saved in zip(velocity, expected["velocity"])))
+			if not math.isfinite(error) or error > 5.0:
+				raise CheckpointMismatch(f"{name!r} velocity differs by {error:.2f} m/s.")
+			checked["velocity"] = velocity
+		return checked
 
-	def load_named_save(self, name, *, expected=None, timeout=30.0):
-		self._clear_telemetry()
+	def load_named_save(self, name, *, expected=None, save_path=None, timeout=30.0):
 		krpc_service = self.conn.krpc
+		if self._checkpoint_pause is not None:
+			self.conn.checkpoint_control.cancel(self._checkpoint_pause)
+			self._checkpoint_pause = None
+
+		hook = None
+		token = None
+		if expected is not None:
+			if save_path is None:
+				raise ValueError("Airborne loads require save_path pointing to the worker's .sfs file.")
+			hook = getattr(self.conn, "checkpoint_control", None)
+			if hook is None or not hasattr(hook, "begin_load"):
+				raise RuntimeError("Install the updated CheckpointControl DLL and restart KSP.")
+			saved_ut = self._saved_flight_ut(save_path)
+			if abs(saved_ut - float(expected["ut"])) > 0.25:
+				raise CheckpointMismatch(f"{name!r} metadata UT={expected['ut']:.3f} s disagrees with file UT={saved_ut:.3f} s.")
+			token = uuid4().hex
+
+		self._clear_telemetry()
 		previous_pause = krpc_service.paused
 		try:
 			krpc_service.paused = False
-			self.sc.load(name)
-			deadline = time.monotonic() + timeout
-			if expected is None:
+			if hook is None:
+				self.sc.load(name)
+				deadline = time.monotonic() + timeout
 				self._wait_and_bind(require_pad=True, deadline=deadline, label=name)
 				self.manual_control()
 				return self.read_observation()
 
-			checked = self._bind_loaded_checkpoint(name, expected, deadline)
+			deadline = time.monotonic() + timeout
+			hook.begin_load(token, name, saved_ut)
+			while time.monotonic() < deadline:
+				status = hook.get_status(token)
+				if status == "paused":
+					break
+				if status != "armed":
+					raise RuntimeError(f"{name!r} checkpoint hook: {hook.get_diagnostics(token)}.")
+				time.sleep(0.05)
+			else:
+				raise TimeoutError(f"{name!r} produced no checkpoint pause acknowledgement: {hook.get_diagnostics(token)}.")
+
+			paused_ut = hook.get_paused_ut(token)
+			live_ut = float(self.sc.ut)
+			print(f"[ksp] Loaded {name!r}: hook UT={paused_ut:.3f}, live UT={live_ut:.3f}, drift={live_ut - paused_ut:+.3f}s", flush=True)
+
+			self._bind_vessel()
+			checked = self._verify_checkpoint(name, expected, altitude_tolerance=15.0)
 			self.manual_control()
 			observation = self.read_observation()
+			if not krpc_service.paused:
+				raise RuntimeError(f"{name!r} resumed before telemetry setup finished.")
 			observation.update(checked)
+			self._checkpoint_pause = token
+			print(f"[ksp] Verified {name!r} while paused: file UT={saved_ut:.3f}, hook UT={paused_ut:.3f}, altitude={checked['altitude']:.2f} m", flush=True)
 			return observation
 		finally:
-			krpc_service.paused = previous_pause
-
-	def _bind_loaded_checkpoint(self, name, expected, deadline):
-		sc = self.sc
-		krpc_service = self.conn.krpc
-		vessel_name = expected["vessel"]
-		body_name = expected["body"]
-		stage = int(expected["stage"])
-		expected_ut = float(expected["ut"])
-		min_ut = expected_ut - 0.25
-		max_ut = expected_ut + 0.50
-
-		def pause_at_checkpoint():
-			ut = sc.ut
-			if ut < min_ut or ut > max_ut:
-				return False, ut
-			vessel = sc.active_vessel
-			if vessel is None:
-				return False, ut
-			if vessel.name != vessel_name or vessel.orbit.body.name != body_name:
-				return False, ut
-			if vessel.control.current_stage != stage:
-				return False, ut
-			root = vessel.parts.root
-			if root is None:
-				return False, ut
-			krpc_service.paused = True
-			return True, ut
-
-		closest_ut = None
-		last_error = None
-		while time.monotonic() < deadline:
-			try:
-				ready, ut = self.conn.run(pause_at_checkpoint)
-				if closest_ut is None or abs(ut - expected_ut) < abs(closest_ut - expected_ut):
-					closest_ut = ut
-				if ready:
-					if not krpc_service.paused:
-						raise CheckpointMismatch(f"{name!r} did not pause on reload.")
-					self._bind_vessel()
-					return self._verify_checkpoint(name, expected, altitude_tolerance=50.0)
-			except (RuntimeError, self.conn.krpc.ObjectDestroyedException) as error:
-				if not self._vessel_unavailable(error):
-					raise
-				last_error = error
-				if krpc_service.paused:
-					krpc_service.paused = False
-			time.sleep(0.02)
-
-		raise TimeoutError(f"KSP did not load {name!r} within the checkpoint window: expected UT={expected_ut:.3f}, closest sampled UT={closest_ut!r}") from last_error
+			# Keep a successful airborne load paused until its first action.
+			if self._checkpoint_pause is None:
+				try:
+					if hook is not None:
+						hook.cancel(token)
+				finally:
+					krpc_service.paused = previous_pause

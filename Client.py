@@ -379,7 +379,7 @@ class KSPClient:
 						raise SaveUnavailable(str(error)) from error
 
 				self.sc.save(name)
-				if not krpc_service.paused:
+				if not krpc_service.paused or abs(float(self.sc.ut) - frozen_ut) > 1e-6:
 					raise SaveUnavailable("Game time advanced during the paused save.")
 			finally:
 				krpc_service.paused = previous_pause

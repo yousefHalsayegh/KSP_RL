@@ -1,0 +1,111 @@
+
+=== KSP trainer started ===
+Timeout (0:01:00)!
+Thread 0x000051a8 (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x0000262c (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x000033f4 (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00003d38 (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00005e3c (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x000012a0 (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00002c34 (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00000b84 (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00004bdc (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00006368 (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00004d4c (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00002c38 (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 114 in partial_receive
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 717 in _read_updates
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\streammanager.py", line 701 in update_thread
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1012 in run
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00006100 (most recent call first):
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 85 in _fill
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\connection.py", line 66 in receive_message
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Lib\site-packages\krpc\client.py", line 633 in _invoke
+  File "<string>", line 1 in <lambda>
+  File "C:\Users\Yoyo\Documents\GitHub\KSP_RL\client.py", line 461 in load_named_save
+  File "C:\Users\Yoyo\Documents\GitHub\KSP_RL\training.py", line 105 in reset_worker
+  File "C:\Users\Yoyo\Documents\GitHub\KSP_RL\training.py", line 322 in train
+  File "C:\Users\Yoyo\Documents\GitHub\KSP_RL\main.py", line 267 in main
+  File "C:\Users\Yoyo\anaconda3\envs\ksp\Scripts\launch.exe\__main__.py", line 5 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 198 in _run_module_as_main

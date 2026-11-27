@@ -1,5 +1,6 @@
 import argparse
 import ctypes
+import faulthandler
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -212,11 +213,17 @@ def wait_for_flights(workers, timeout=120.0):
 
 
 def main():
+	global _stack_log
+	log_path = Path(__file__).resolve().with_name("training_stall.log")
+	_stack_log = log_path.open("a", encoding="utf-8", buffering=1)
+	print("\n=== KSP trainer started ===", file=_stack_log, flush=True)
+	faulthandler.dump_traceback_later(60, repeat=True, file=_stack_log)
+
 	parser = argparse.ArgumentParser(description="Launch KSP training instances.")
 	parser.add_argument("--ksp", required=True, help="Path to KSP_x64.exe")
 	parser.add_argument("--instances", type=int, default=2)
-	parser.add_argument("--width", type=int, default=1)
-	parser.add_argument("--height", type=int, default=1)
+	parser.add_argument("--width", type=int, default=100)
+	parser.add_argument("--height", type=int, default=100)
 	parser.add_argument("--startup-timeout", type=float, default=240.0)
 	parser.add_argument("--base-rpc-port", type=int, default=50000)
 	parser.add_argument("--connection-timeout", type=float, default=900.0)

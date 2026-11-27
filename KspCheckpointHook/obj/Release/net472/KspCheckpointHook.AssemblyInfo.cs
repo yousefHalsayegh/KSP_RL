@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("KspCheckpointHook")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+52722622fca7bf6a6c129e39f707ab54d866241f")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+79489745ef73f29a41890d9994125789d4360f5a")]
 [assembly: System.Reflection.AssemblyProductAttribute("KspCheckpointHook")]
 [assembly: System.Reflection.AssemblyTitleAttribute("KspCheckpointHook")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

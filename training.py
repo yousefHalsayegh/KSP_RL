@@ -58,7 +58,7 @@ def record_curriculum_step(worker, reward, terminated, truncated, info):
 		curriculum.observe(flight, altitude=float(observation["altitude"]), viable=viable, episode_return=episode_return, capture=capture)
 
 	if done:
-		info["start_source"] = "explore" if flight.phase == "explore" else "checkpoint" if flight.start else "pad"
+		info["start_source"] = "checkpoint" if flight.start else "pad"
 		info["start_checkpoint_id"] = flight.start["id"] if flight.start else None
 		curriculum.finish(flight, episode_return=episode_return, reason=info.get("end_reason") or "truncated")
 
@@ -89,7 +89,7 @@ def reset_worker(worker):
 					if not source.is_file():
 						raise CheckpointMismatch(f"Checkpoint was removed: {source}")
 
-					if flight.phase == "explore" or not local_save.is_file():
+					if not local_save.is_file():
 						temporary = local_save.with_suffix(".sfs.tmp")
 						try:
 							copyfile(source, temporary)
@@ -117,6 +117,7 @@ def reset_worker(worker):
 				curriculum.load_failed(flight, error)
 				if flight.start is None:
 					raise
+
 				curriculum.discard_checkpoint(flight, error)
 				tqdm.write(f"Worker {worker['index']}: discarded {flight.start['id']}; selecting a new start. {error}")
 				continue
@@ -135,11 +136,6 @@ def step_worker(worker, action):
 	if not np.all(np.isfinite(state)) or not np.isfinite(reward):
 		raise ValueError(f"Worker {worker['index']} returned an invalid transition")
 
-	telemetry = info.get("telemetry") or {}
-	if "altitude" in telemetry and not info.get("telemetry_stale"):
-		worker["peak_m"] = max(worker.get("peak_m", float("-inf")), float(telemetry["altitude"]))
-	if terminated or truncated:
-		info["peak_m"] = worker.pop("peak_m", None)
 	final_state = state.copy()
 	record_curriculum_step(worker, reward, terminated, truncated, info)
 	following_state = reset_worker(worker) if terminated or truncated else state.copy()
@@ -163,8 +159,6 @@ def collect_rollout(agent, workers, executor, steps, on_step=None):
 	}
 	agent.eval()
 	pending = {}
-	recoveries = set()
-	failures = [0] * count
 
 	def submit(i, t):
 		worker = workers[i]
@@ -188,34 +182,7 @@ def collect_rollout(agent, workers, executor, steps, on_step=None):
 		for future in ready:
 			i, t = pending.pop(future)
 			worker = workers[i]
-			try:
-				result = future.result()
-			except (RuntimeError, TimeoutError, ConnectionError, OSError) as error:
-				message = str(error).lower()
-				if not isinstance(error, (TimeoutError, ConnectionError)) and not any(
-					hint in message for hint in ("checkpoint", "game time stopped", "vessel has no parts", "object no longer exists", "part no longer exists")
-				):
-					raise
-				worker.pop("peak_m", None)
-				recoveries.discard(future)
-				failures[i] += 1
-				if failures[i] > 3:
-					raise RuntimeError(f"Worker {worker['index']} failed three recovery attempts") from error
-				if t and not rollout["terminated"][t - 1, i]:
-					rollout["truncated"][t - 1, i] = True
-				worker["episode_return"], worker["episode_steps"] = 0.0, 0
-				tqdm.write(f"Worker {worker['index']} resetting after {type(error).__name__}: {str(error).splitlines()[0]}")
-				retry = executor.submit(reset_worker, worker)
-				recoveries.add(retry)
-				pending[retry] = (i, t)
-				continue
-			if future in recoveries:
-				recoveries.remove(future)
-				worker["state"] = result
-				submit(i, t)
-				continue
-			failures[i] = 0
-			final_state, reward, terminated, truncated, info, following_state = result
+			final_state, reward, terminated, truncated, info, following_state = future.result()
 			rollout["rewards"][t, i] = reward
 			rollout["terminated"][t, i] = terminated
 			rollout["truncated"][t, i] = truncated
@@ -231,15 +198,7 @@ def collect_rollout(agent, workers, executor, steps, on_step=None):
 			infos.append(info)
 			if terminated or truncated:
 				finished.append(
-					{
-						"peak_m": info.get("peak_m"),
-						"start_source": info.get("start_source", "pad"),
-						"worker": worker["index"],
-						"return": worker["episode_return"],
-						"length": worker["episode_steps"],
-						"success": bool(info.get("success", False)),
-						"reason": info.get("end_reason"),
-					}
+					{"worker": worker["index"], "return": worker["episode_return"], "length": worker["episode_steps"], "success": bool(info.get("success", False)), "reason": info.get("end_reason")}
 				)
 				worker["episode_return"] = 0.0
 				worker["episode_steps"] = 0
@@ -252,7 +211,7 @@ def collect_rollout(agent, workers, executor, steps, on_step=None):
 				# while other workers finish collecting their own quotas.
 				worker["connection"].krpc.paused = True
 
-		if on_step is not None and rewards:
+		if on_step is not None:
 			on_step(np.asarray(rewards, dtype=np.float32), infos, finished)
 
 	return rollout
@@ -349,7 +308,7 @@ def train(args, workers):
 			for worker in workers:
 				if not hasattr(worker["connection"], "checkpoint_control"):
 					raise RuntimeError(f"Worker {worker['index']} has no CheckpointControl service. Install the checkpoint hook DLL and restart KSP.")
-			curriculum = AltitudeCurriculum(args.curriculum_dir, pad_workers=(0, 1), explorers=range(max(3, len(workers) - 3), len(workers)), window=10)
+			curriculum = AltitudeCurriculum(args.curriculum_dir, pad_workers=(0, 1), window=10)
 			if "curriculum" in saved:
 				curriculum.restore(saved["curriculum"])
 
@@ -433,11 +392,6 @@ def train(args, workers):
 					if finished:
 						log.update(
 							{
-								**{
-									f"episode/{source}_peak_altitude_m": float(np.mean(peaks))
-									for source in ("pad", "checkpoint", "explore")
-									if (peaks := [e["peak_m"] for e in finished if e["start_source"] == source and e["peak_m"] is not None])
-								},
 								"episode/return_mean": float(np.mean([e["return"] for e in finished])),
 								"episode/length_mean": float(np.mean([e["length"] for e in finished])),
 								"episode/success_rate": successful_episodes / episode_count,

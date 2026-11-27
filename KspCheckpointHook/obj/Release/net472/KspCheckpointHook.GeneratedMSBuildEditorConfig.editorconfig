@@ -1,6 +1,6 @@
 is_global = true
 build_property.RootNamespace = KspCheckpointHook
-build_property.ProjectDir = C:\Users\Yoyo\documents\github\ksp_rl\KspCheckpointHook\
+build_property.ProjectDir = C:\Users\Yoyo\Documents\GitHub\KSP_RL\KspCheckpointHook\
 build_property.EnableComHosting = 
 build_property.EnableGeneratedComInterfaceComImportInterop = 
 build_property.CsWinRTUseWindowsUIXamlProjections = false

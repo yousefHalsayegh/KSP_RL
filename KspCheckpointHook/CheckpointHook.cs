@@ -101,6 +101,8 @@ namespace KspRl
             CheckpointHook.EnsureInstalled();
             Expire();
             // A reconnect can supersede an interrupted request on this worker.
+            if (status == "paused")
+                FlightDriver.SetPause(false);
             token = request;
             saveName = name;
             savedUt = ut;
@@ -185,7 +187,6 @@ namespace KspRl
                 pausedUt = Planetarium.GetUniversalTime();
                 pauseSource = source;
                 status = "paused";
-                expires = DateTime.UtcNow.AddMinutes(10);
                 Debug.Log($"[KSP-RL checkpoint] Paused {saveName}, token={token}, " +
                           $"source={source}, saved UT={savedUt:F3}, live UT={pausedUt:F3}, " +
                           $"delta={pausedUt - savedUt:+0.000;-0.000;0.000}s");
@@ -237,18 +238,20 @@ namespace KspRl
         [KRPCProcedure]
         public static void Cancel(string request)
         {
-            if (token == request)
-                Clear();
+            if (token != request)
+                return;
+            if (status == "paused")
+                FlightDriver.SetPause(false);
+            Clear();
         }
 
         internal static void Expire()
         {
-            if ((status != "armed" && status != "paused") || DateTime.UtcNow < expires)
+            if (status != "armed" || DateTime.UtcNow < expires)
                 return;
-            if (status == "paused")
-                FlightDriver.SetPause(false);
+
             status = "expired";
-            Debug.LogWarning($"[KSP-RL checkpoint] Request expired for {saveName}, token={token}");
+            Debug.LogWarning($"[KSP-RL checkpoint] Load expired for {saveName}, token={token}");
         }
 
         private static void Clear()
